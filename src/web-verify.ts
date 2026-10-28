@@ -411,20 +411,30 @@ export class WebVerifier {
     const options = this.verifier.getRegionLabels()
     const isMath = question.type === VerifyType.MATH
 
+    // 注意：选项按钮和手动输入框必须拆成**两个 form**——
+    // 如果在同一个 form 里，提交时两个同名的 answer 会一起上送（answer=A1&answer=），
+    // 服务端取到空值就会误判成「没有选择答案」。
+    const action = `?g=${encodeURIComponent(guildId)}`
     const answerArea = isMath
-      ? `<div class="options">
-          <input class="num" type="text" name="answer" inputmode="numeric" placeholder="输入计算结果" required>
-        </div>
-        <button class="submit" type="submit">提交答案</button>`
-      : `<div class="options">
-          ${options.map((code) => `<button class="opt" type="submit" name="answer" value="${code}">${code}</button>`).join('')}
-        </div>
+      ? `<form method="POST" action="${action}">
+          <div class="options">
+            <input class="num" type="text" name="answer" inputmode="numeric" placeholder="输入计算结果" required>
+          </div>
+          <button class="submit" type="submit">提交答案</button>
+        </form>`
+      : `<form method="POST" action="${action}">
+          <div class="options">
+            ${options.map((code) => `<button class="opt" type="submit" name="answer" value="${code}">${code}</button>`).join('')}
+          </div>
+        </form>
         <details>
           <summary>按钮点不动？手动输入区域代号</summary>
-          <div class="options" style="margin-top:8px">
-            <input class="num" type="text" name="answer" placeholder="例如 B2 或 B2,C2">
-          </div>
-          <button class="submit" type="submit">提交</button>
+          <form method="POST" action="${action}" style="margin-top:8px">
+            <div class="options">
+              <input class="num" type="text" name="answer" placeholder="例如 B2 或 B2,C2">
+            </div>
+            <button class="submit" type="submit">提交</button>
+          </form>
         </details>`
 
     return this.renderPage({
@@ -434,9 +444,7 @@ export class WebVerifier {
 ${notice ? `<p class="notice">${escapeHtml(notice)}</p>` : ''}
 <p class="prompt">${escapeHtml(question.prompt).replace(/\n/g, '<br>')}</p>
 ${question.imageBase64 && !isMath ? `<div class="pic"><img src="data:image/png;base64,${question.imageBase64}" alt="题目图片"></div>` : ''}
-<form method="POST" action="?g=${encodeURIComponent(guildId)}">
-  ${answerArea}
-</form>
+${answerArea}
 <p class="hint">剩余机会：<b>${left}</b> 次 ｜ 答错太多次会进入冷却</p>
 </div>`,
     })
@@ -508,7 +516,7 @@ function escapeHtml(text: string): string {
     .replace(/"/g, '&quot;')
 }
 
-/** 读 POST 表单（application/x-www-form-urlencoded） */
+/** 读 POST 表单（application/x-www-form-urlencoded）；同名 key 取第一个非空值 */
 async function readForm(req: IncomingMessage): Promise<Record<string, string>> {
   const chunks: Buffer[] = []
   let size = 0
@@ -522,5 +530,14 @@ async function readForm(req: IncomingMessage): Promise<Record<string, string>> {
   }
 
   const raw = Buffer.concat(chunks).toString('utf8')
-  return Object.fromEntries(new URLSearchParams(raw))
+  const params = new URLSearchParams(raw)
+  const result: Record<string, string> = {}
+
+  for (const key of new Set(params.keys())) {
+    const values = params.getAll(key)
+    const nonEmpty = values.find((v) => v.trim() !== '')
+    result[key] = nonEmpty ?? values[0] ?? ''
+  }
+
+  return result
 }
