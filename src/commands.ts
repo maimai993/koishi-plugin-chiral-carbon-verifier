@@ -1,9 +1,8 @@
 import { Context, h } from 'koishi'
-import {} from 'koishi-plugin-adapter-onebot'
 import { Config, VerifyStatus } from './types'
 import { DatabaseService } from './database'
 import { Verifier } from './verifier'
-import { EventUtils } from './events'
+import { EventUtils, getOnebot } from './events'
 
 /** 注册命令 */
 export function registerCommands(
@@ -90,13 +89,14 @@ export function registerCommands(
 
       // 检查目标用户是否为管理员或群主（移植自原插件）
       try {
-        if (session.onebot) {
-          const memberInfo = await session.onebot.getGroupMemberInfo(session.guildId, targetUserId)
-          if (memberInfo.role === 'owner' || memberInfo.role === 'admin') {
+        const onebot = getOnebot(session)
+        if (onebot?.getGroupMemberInfo) {
+          const memberInfo = await onebot.getGroupMemberInfo(session.guildId, targetUserId)
+          if (memberInfo?.role === 'owner' || memberInfo?.role === 'admin') {
             return '这对吗'
           }
           // 检查入群时长
-          if (config.reverifyMaxJoinDays > 0 && memberInfo.join_time) {
+          if (config.reverifyMaxJoinDays > 0 && memberInfo?.join_time) {
             const joinDays = (Date.now() / 1000 - memberInfo.join_time) / 86400
             if (joinDays > config.reverifyMaxJoinDays) {
               return `该成员已入群 ${Math.floor(joinDays)} 天，超过 ${config.reverifyMaxJoinDays} 天限制，无法重新验证`
@@ -112,31 +112,14 @@ export function registerCommands(
         return '该用户已在验证中..'
       }
 
-      // 开始验证
-      const result = await verifier.startVerify(session.guildId, targetUserId, session.platform)
-      
-      if (!result.success) {
+      // 开始验证（含超时提醒与超时处理）；发送目标仍走当前会话，只是 userId 换成目标用户
+      const started = await utils.startVerifyAndWatch({
+        ...utils.targetOf(session),
+        userId: targetUserId,
+      })
+      if (!started) {
         return '启动验证失败'
       }
-
-      // 发送验证消息
-      await session.send(result.message)
-
-      // 设置超时处理
-      ctx.setTimeout(async () => {
-        if (verifier.isVerifying(session.guildId, targetUserId)) {
-          await verifier.handleTimeout(session.guildId, targetUserId)
-          
-          await session.send([
-            h.at(targetUserId),
-            h.text('\n' + config.messages.verifyTimeout),
-          ])
-
-          if (config.kickOnFail) {
-            await utils.kickUser(session, targetUserId)
-          }
-        }
-      }, config.verifyTimeout * 1000)
     })
 
   // ==================== 开启/关闭验证 ====================
@@ -310,10 +293,21 @@ export function registerCommands(
         `💪 困难模式: ${groupConfig.hardMode ? '是' : '否'}`,
         `💡 显示提示: ${groupConfig.showHint ? '是' : '否'}`,
         `━━━━━━━━━━━━━━`,
-        `⏱️ 超时时间: ${config.verifyTimeout} 秒`,
+        `⏱️ 超时时间: ${config.verifyTimeout > 0 ? `${config.verifyTimeout} 秒` : '不限时'}`,
         `🔢 最大尝试: ${config.maxAttempts} 次`,
         `🗑️ 撤回错误: ${config.recallWrongAnswer ? '是' : '否'}`,
-        `👢 失败踢出: ${config.kickOnFail ? '是' : '否'}`,
+        `👢 失败处理: ${
+          config.failAction === 'kick'
+            ? '踢出群聊'
+            : config.failAction === 'ban'
+              ? `禁言 ${
+                  config.banDurationDoubling
+                    ? `${config.banDuration} 分钟起、逐轮翻倍（上限 ${Math.max(config.banDuration, config.banDurationMax)} 分钟）`
+                    : `${config.banDuration} 分钟`
+                }后重新验证`
+              : '不处理'
+        }`,
+        `🔘 题目按钮: ${config.verifyButtons ? '开' : '关'}`,
       ].join('\n')
     })
 }
@@ -322,9 +316,10 @@ export function registerCommands(
 async function checkIsAdmin(session: any): Promise<boolean> {
   try {
     // OneBot 适配器
-    if (session.onebot) {
-      const info = await session.onebot.getGroupMemberInfo(session.guildId, session.userId)
-      return info.role === 'owner' || info.role === 'admin'
+    const onebot = getOnebot(session)
+    if (onebot?.getGroupMemberInfo) {
+      const info = await onebot.getGroupMemberInfo(session.guildId, session.userId)
+      return info?.role === 'owner' || info?.role === 'admin'
     }
 
     // 标准 API（如果有）

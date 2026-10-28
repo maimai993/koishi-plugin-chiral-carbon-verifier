@@ -18,10 +18,14 @@
 - 🧪 **手性碳验证**：发送有机化学分子结构图，要求新成员识别手性碳原子所在区域
 - 🔢 **数字验证**：简单的数学计算题作为备选方案
 - 🔄 **自动降级**：当手性碳 API 不可用时，自动切换为数字验证
+- 🖼️ **QQ markdown 发图**：QQ 平台用 markdown 发送题目图片（图片走 assets 服务拿公网地址），不会被二次压缩
+- 🔘 **区域按钮作答**：QQ 题目消息带 A1、B2… 一组**回调按钮**（代号按棋盘格配色从图里自动数出来），点按钮直接作答
+- 📈 **禁言翻倍**：禁言模式下同一成员每失败一轮，禁言时长翻倍（10→20→40→80…），并受上限约束
+- 💾 **状态持久化**：验证状态写入数据库，**禁言等待中重启 koishi 也不会漏掉验证**
 - ⚙️ **灵活配置**：支持全局配置 + 群单独配置
 - 💪 **困难模式**：可要求答出所有手性碳区域
 - 📊 **统计功能**：记录验证历史，可查看通过率
-- 👢 **自动踢人**：验证失败或超时可自动踢出
+- 👢 **失败处理**：可配置踢出 / 禁言后重试 / 不处理
 
 ## 📦 安装
 
@@ -40,15 +44,29 @@ yarn add koishi-plugin-chiral-carbon-verifier
 | `enabled` | boolean | `true` | 是否全局启用入群验证 |
 | `carbonApiUrl` | string | `https://carbon.crystelf.top` | 手性碳验证 API 地址 |
 | `apiTimeout` | number | `10000` | API 请求超时时间（毫秒） |
+| `qqMarkdownImage` | boolean | `true` | QQ 平台用 markdown 发送题目图片（需 assets 服务；失败自动退回普通图片） |
+| `markdownImageWidth` | number | `420` | markdown 图片的显示宽度上限（px），高度按真实比例缩放 |
+
+> 🖼️ **QQ 平台发图说明**：QQ 官方 / qq-crack 适配器上，普通图片消息会被二次压缩，题目图上的小字会糊掉，
+> 所以题目图改走 **markdown 图片** `![#宽px #高px](地址)`：
+> - 图片地址必须是**可公网访问的 http(s)**，base64 不行 → 插件会把 API 返回的图片先上传到 **assets 服务**（`koishi-plugin-assets-local` 等）拿地址；
+> - markdown 图片**必须写尺寸**，否则手机端不显示；尺寸从图片二进制头读真实值（PNG/JPEG/GIF/WebP），按比例缩放，不会拉伸；
+> - 没装 assets / 上传失败 / 读不出尺寸 → 自动退回普通图片段，消息照常能发；
+> - 只在 `qq` 系平台生效（OneBot / NapCat / Satori / QQ 频道都不走 md，否则会变成一串乱码）。
 
 ### 验证行为配置
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `verifyTimeout` | number | `120` | 验证超时时间（秒） |
+| `verifyTimeout` | number | `120` | 验证超时时间（秒），**填 `0` 表示不限时**（不超时、不因超时踢人/禁言） |
 | `maxAttempts` | number | `3` | 最大尝试次数 |
 | `recallWrongAnswer` | boolean | `true` | 是否撤回错误回答 |
-| `kickOnFail` | boolean | `true` | 验证失败是否踢出群 |
+| `failAction` | `kick` / `ban` / `none` | `kick` | 验证失败（次数用完或超时）时的处理方式 |
+| `banDuration` | number | `10` | **基础**禁言时长（分钟），仅 `failAction = ban` 时生效，禁言结束后自动重新发送题目 |
+| `banDurationDoubling` | boolean | `true` | 禁言时长逐轮翻倍（1→2→4→8…），同一个成员在禁言—作答循环里每失败一次就乘 2 |
+| `banDurationMax` | number | `60` | 禁言时长上限（分钟），翻倍涨到这里就不再增加 |
+| `verifyButtons` | boolean | `true` | QQ 平台在题目消息里附带区域代号按钮（详见下方按钮说明） |
+| `buttonRegions` | string | `auto` | 按钮上的候选区域代号；`auto` = 从题目图自动数格子（见下方说明），也可手写覆盖 |
 | `reminderBeforeTimeout` | number | `60` | 超时前提醒时间（秒），0 为不提醒 |
 
 ### 主人账号配置
@@ -101,15 +119,99 @@ yarn add koishi-plugin-chiral-carbon-verifier
 │
 └─ 失败 → 降级为数字验证（发送数学题）
     ↓
-等待用户回答
+等待用户回答（打字发区域代号 / 点题目里的区域按钮）
     ↓
 ┌─ 答对 → 验证通过，欢迎入群
 │
-├─ 答错 → 减少剩余次数，提示重试
-│   └─ 次数用完 → 验证失败，踢出群
+├─ 答错 → 减少剩余次数，提示重试（答案里混入错误区域也直接算错）
+│   └─ 次数用完 → 按 failAction 处理
 │
-└─ 超时 → 验证超时，踢出群
+└─ 超时 → 按 failAction 处理
+
+failAction:
+  kick → 直接踢出群
+  ban  → 禁言 N 分钟（banDuration），禁言结束后自动重新发送题目，可以再试一次
+  none → 只提示，不做处理
 ```
+
+## ✍️ 答案判定规则
+
+- 支持 `A1,B1` / `A1 B1` / `A1、B1` / `A1A2B1`（连写）等写法
+- **答案里只要出现一个错误的区域代号，立即判为本次答错**（防止「把区域全写一遍总有一个中」）
+- 简单模式下答对任意一个区域即可通过；困难模式下必须答出全部区域
+
+## 🔘 区域代号按钮（点按钮作答，只有本人点了才有反应）
+
+QQ 平台的题目消息里，除了图之外还带一组**回调按钮**：
+
+```
+[A1] [A2] [A3] [B1] [B2]  ← 每行 5 个，共 15 个（按图上格子自动数出来）
+[B3] [C1] [C2] [C3] [D1]
+[D2] [D3] [E1] [E2] [E3]
+[✅ 提交答案] [🧹 清空]     ← 只在困难模式出现
+```
+
+- **点区域按钮就是作答**：
+  - 简单模式：点哪个就按哪个判，点中就通过；
+  - 困难模式：点按钮 = 选中（可多选），点「✅ 提交答案」才判定，点「🧹 清空」重选。
+- **全部是回调按钮**（`action.type = 1`）：点击只把 `data` 回调给后台、触发 `INTERACTION_CREATE`，
+  **不会在输入框插入 `@bot 指令`、也不会多发一条消息**，所以不存在「指令消息被自动撤回」的问题。
+  按官方文档 `action.type` 是 `0 跳转 / 1 回调 / 2 指令`——不写的话 qq-crack 默认按 **2（指令）** 处理，
+  这里显式写 1，并且把只对指令按钮生效的 `enter`/`reply` 关掉。
+  （文档：[消息按钮](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/trans/msg-btn.html) ／
+  [互动事件 INTERACTION_CREATE](https://bot.q.qq.com/wiki/develop/api-v2/autogen/event/interaction_create.html)）
+- **只认「点按钮的那个人」**：`INTERACTION_CREATE` 事件带的是点击者自己的 openid（群聊里是 `group_member_openid`，
+  适配器写进 `session.userId`，插件还会兜底读 `event.button.user_id`），插件拿这个 id 去比对当前验证会话：
+  - 对上了（本人点的）→ 当作一次作答；
+  - 对不上（路人、已经通过、已经超时）→ 静默忽略，**一个字都不回**；
+  - 完全认不出是谁点的 → 也直接忽略。
+  别人点按钮既不会替他作答，也不会让真正的验证对象通过。
+- 答题结束时插件会**撤回题目消息**；答错但还有机会时**不撤回**（图还在，可以接着看）。
+- 具体实现：消息里追加 `button` 元素 → 适配器编进 `keyboard` 随 markdown 下发 → 用户点击 →
+  平台推 `INTERACTION_CREATE` → 适配器转成 `interaction/button` 会话 →
+  `session.event.button.data` 里是 `ccv:a:B2` 这类字符串（`ccv:` 前缀用来区分别的插件的按钮）。
+- ⚠️ 手性碳 API 只返回**正确区域**，不返回图上一共有哪些格子，所以插件会**自己数格子**：
+  题目图的格子是**棋盘格配色**——相邻格子异色、斜对角同色（A1 与 B2 同色、B1 与 A2 同色），
+  插件解码 PNG 后拿这两种底色去套不同的行列数，哪种切分能让「同奇偶的格子全同色」就说明切对了
+  （实测 6 张图都是 **5 列 × 3 行 → A1…E3**，置信度 0.98+，耗时 50~170ms，只在出题时算一次）。
+  格子上印的「A1」这类文字、以及分子结构线都属于「其他颜色」，会被自动排除，不影响判断。
+  识别不出来（图不是 PNG、配色非常规）→ 退回默认 `A1…E3` 或你在 `buttonRegions` 里手写的列表。
+- ⚠️ 需要支持 `INTERACTION_CREATE` 的适配器（`koishi-plugin-adapter-qq-crack` 这类）并在开放平台开通按钮交互权限；
+  OneBot / NapCat / Satori / QQ 频道不支持这个元素，这些平台不带按钮（打字作答照常）。
+
+## 📈 禁言时长翻倍
+
+`failAction = ban` 时，同一个成员的禁言时长会**逐轮翻倍**：
+
+```
+第 1 次失败 → 10 分钟   (banDuration)
+第 2 次失败 → 20 分钟
+第 3 次失败 → 40 分钟
+第 4 次失败 → 60 分钟   (到 banDurationMax 封顶)
+第 5 次及以后 → 60 分钟
+```
+
+- 轮数记在数据库 `chiral_verify_records.failRounds` 里，**重启不清零**；
+- 「禁言 → 自动重发题目 → 又答错」算同一波拉锯，会继续翻倍；
+- 验证**通过**之后计数归零，下次（比如很久以后重新入群）又从基础时长开始；
+- 关掉 `banDurationDoubling` 就是每轮固定 `banDuration` 分钟；
+- 禁言时长永远不会超过 `banDurationMax`。
+
+## 💾 状态持久化 / 重启恢复
+
+验证状态写在数据库 `chiral_verify_records` 表里（`status = pending` + `notBefore` 等待期），
+所以 **禁言等待中重启 koishi，也不会出现「这个人不用验证了」的情况**：
+
+- 启动时（`ready` 事件）会扫描所有 `pending` 记录：
+  - 还在等待期（禁言没结束）→ 恢复定时器，到点自动重发题目；
+  - 已经过了等待期 → 立刻重新发题目并重新计时；
+- 同一个用户只保留**一条** pending 记录（禁言 → 重发题目是原地重置，不会越攒越多）；
+- 太老的记录（停机很久 / 人早走了，超过 `banDuration + verifyTimeout + 10 分钟`）直接标记 `expired`，
+  **不恢复也不处罚**，避免重启后误踢老群友；
+- 用户退群会立刻把 pending 记录结掉，重启时不会被重新捞出来。
+
+> 从旧版本升级时 `chiral_verify_records` 会新增 `expiresAt` / `notBefore` 两列（sqlite 会自动补列）；
+> 如果数据库驱动没自动迁移，删掉 `data/koishi.db` 重建即可（历史统计会一起清空）。
 
 ## 🧪 手性碳是什么？
 
@@ -119,7 +221,9 @@ yarn add koishi-plugin-chiral-carbon-verifier
 
 ## ⚠️ 注意事项
 
-- 需要 bot 具有群管理员权限才能踢人
+- 需要 bot 具有群管理员权限才能踢人或禁言
+- QQ 平台用 markdown 发图需要 **assets 服务**（`koishi-plugin-assets-local` 等），且 `baseUrl` 必须是 QQ 能访问到的公网地址
+- QQ 题目按钮需要 `qq-crack` 这类支持 `INTERACTION_CREATE` 的适配器，并在开放平台开通按钮交互权限
 - 手性碳 API 默认使用 `https://carbon.crystelf.top`，可在配置中修改
 - 主人账号会自动绕过验证
 - 建议将 `verifyTimeout` 设置为 120 秒以上，给新成员足够的答题时间

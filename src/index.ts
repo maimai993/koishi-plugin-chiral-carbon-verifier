@@ -1,5 +1,4 @@
 import { Context } from 'koishi'
-import {} from 'koishi-plugin-adapter-onebot'
 import { Config } from './types'
 import { extendDatabase, DatabaseService } from './database'
 import { Verifier } from './verifier'
@@ -17,6 +16,8 @@ const pkg = JSON.parse(
 
 export const inject = {
   required: ['database', 'http'],
+  /** assets 可选：装了才能用 QQ markdown 发题目图（要上传拿公网地址） */
+  optional: ['assets'],
 }
 
 export { Config } from './types'
@@ -64,8 +65,8 @@ export const usage = `
 <h3>💬 自定义文案模板变量说明</h3>
 <table>
   <tr><th>配置项</th><th>可用变量</th><th>说明</th></tr>
-  <tr><td><code>mathPrompt</code></td><td><code>{timeout}</code> <code>{expression}</code></td><td>数学验证提示</td></tr>
-  <tr><td><code>carbonPrompt</code></td><td><code>{timeout}</code> <code>{modeHint}</code> <code>{regionCount}</code></td><td>手性碳验证提示</td></tr>
+  <tr><td><code>mathPrompt</code></td><td><code>{timeout}</code> <code>{timeoutText}</code> <code>{expression}</code></td><td>数学验证提示</td></tr>
+  <tr><td><code>carbonPrompt</code></td><td><code>{timeout}</code> <code>{timeoutText}</code> <code>{modeHint}</code> <code>{regionCount}</code></td><td>手性碳验证提示</td></tr>
   <tr><td><code>wrongAnswer</code></td><td><code>{remaining}</code></td><td>答错提醒</td></tr>
   <tr><td><code>timeoutReminder</code></td><td><code>{seconds}</code></td><td>超时前提醒</td></tr>
 </table>
@@ -74,7 +75,7 @@ export const usage = `
 
 <h3>⚠️ 注意事项</h3>
 <ul>
-  <li>需要 bot 有群管理员权限才能踢人</li>
+  <li>需要 bot 有群管理员权限才能踢人或禁言</li>
   <li>手性碳 API 默认使用 <code>https://carbon.crystelf.top</code>，可在配置中修改</li>
   <li>主人账号可自动绕过验证</li>
 </ul>
@@ -104,6 +105,11 @@ export function apply(ctx: Context, config: Config) {
 
   // 注册命令
   registerCommands(ctx, config, db, verifier, utils)
+
+  // 重启后恢复未完成的验证：禁言等待中重启 koishi 也不会漏掉验证
+  ctx.on('ready', () => {
+    utils.resumePending().catch((error) => logger.warn('恢复未完成的验证失败:', error))
+  })
 
   // 定时清理过期记录（每小时清理 30 天前的记录）
   ctx.setInterval(async () => {

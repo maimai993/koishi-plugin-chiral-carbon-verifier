@@ -4,6 +4,8 @@ import { VerifyRecord, VerifyStatus, GroupConfig } from './types'
 /** 扩展数据库模型 */
 export function extendDatabase(ctx: Context) {
   // 验证记录表
+  // 注意：除了「历史记录」，这张表还承担**验证状态持久化**的职责 —— 重启后靠
+  // status = pending 的记录把未完成的验证重新捞起来（见 EventUtils.resumePending）。
   ctx.model.extend('chiral_verify_records', {
     id: 'unsigned',
     guildId: 'string',
@@ -11,8 +13,14 @@ export function extendDatabase(ctx: Context) {
     platform: 'string',
     type: 'string',
     attempts: 'unsigned',
+    /** 连续失败轮数（用于禁言时长翻倍：1→2→4→8…） */
+    failRounds: 'unsigned',
     status: 'string',
     createdAt: 'unsigned',
+    /** 本次验证的过期时间戳（0 表示未知） */
+    expiresAt: 'unsigned',
+    /** 等待期结束时间戳：禁言到期后再重新发题目；0 表示没有等待期 */
+    notBefore: 'unsigned',
     completedAt: 'unsigned',
   }, {
     autoInc: true,
@@ -38,32 +46,128 @@ export class DatabaseService {
 
   // ==================== 验证记录 ====================
 
-  /** 创建验证记录 */
-  async createVerifyRecord(data: Omit<VerifyRecord, 'id'>): Promise<VerifyRecord> {
-    return await this.ctx.database.create('chiral_verify_records', data)
+  /** 取用户当前 pending 的记录 */
+  async getPendingRecord(guildId: string, userId: string): Promise<VerifyRecord | undefined> {
+    const records = await this.ctx.database.get('chiral_verify_records', {
+      guildId,
+      userId,
+      status: VerifyStatus.PENDING,
+    })
+    return records.length > 0 ? records[records.length - 1] : undefined
   }
 
-  /** 更新验证记录状态 */
+  /**
+   * 开始（或重置）一次验证记录。
+   *
+   * 同一用户只保留**一条** pending 记录：旧的 pending 直接原地重置，
+   * 否则「禁言 → 重新发题目」每轮都会多一条 pending，重启恢复时会重复捞人。
+   */
+  async startVerifyRecord(data: {
+    guildId: string
+    userId: string
+    platform: string
+    type: string
+    createdAt: number
+    expiresAt: number
+  }): Promise<void> {
+    const payload = {
+      guildId: data.guildId,
+      userId: data.userId,
+      platform: data.platform,
+      type: data.type,
+      attempts: 0,
+      status: VerifyStatus.PENDING,
+      createdAt: data.createdAt,
+      expiresAt: data.expiresAt,
+      notBefore: 0,
+      completedAt: 0,
+    }
+
+    const existing = await this.getPendingRecord(data.guildId, data.userId)
+    if (existing) {
+      // 原地重置：failRounds（翻倍计数）保留，禁言—重发题目算同一轮「拉锯」
+      await this.ctx.database.set('chiral_verify_records', existing.id, payload)
+      return
+    }
+
+    // 新记录：继承上一轮的失败轮数（同一波拉锯里失败次数要累加），通过过的重新算 0
+    const failRounds = await this.inheritFailRounds(data.guildId, data.userId)
+    await this.ctx.database.create('chiral_verify_records', { ...payload, failRounds })
+  }
+
+  /** 最近一条记录（不管状态） */
+  private async getLatestRecord(guildId: string, userId: string): Promise<VerifyRecord | undefined> {
+    const records = await this.ctx.database
+      .select('chiral_verify_records')
+      .where({ guildId, userId })
+      .orderBy('createdAt', 'desc')
+      .limit(1)
+      .execute()
+    return records[0]
+  }
+
+  /**
+   * 继承上一轮的失败轮数：
+   * - 上一条是「通过」→ 0（说明是重新入群的正常用户，从基础时长开始）
+   * - 上一条太久远（> 24 小时）→ 0
+   * - 否则沿用（同一波验证里答错 → 禁言 → 再答错，时长要翻倍）
+   */
+  private async inheritFailRounds(guildId: string, userId: string): Promise<number> {
+    const latest = await this.getLatestRecord(guildId, userId)
+    if (!latest) return 0
+    if (latest.status === VerifyStatus.PASSED) return 0
+    if (Date.now() - Number(latest.createdAt ?? 0) > 24 * 60 * 60 * 1000) return 0
+    return Number(latest.failRounds ?? 0)
+  }
+
+  /** 取连续失败轮数（优先 pending 记录，没有就取最近一条） */
+  async getFailRounds(guildId: string, userId: string): Promise<number> {
+    const record = (await this.getPendingRecord(guildId, userId)) ?? (await this.getLatestRecord(guildId, userId))
+    return Number(record?.failRounds ?? 0)
+  }
+
+  /** 写入连续失败轮数 */
+  async setFailRounds(guildId: string, userId: string, failRounds: number): Promise<void> {
+    const record = (await this.getPendingRecord(guildId, userId)) ?? (await this.getLatestRecord(guildId, userId))
+    if (!record) return
+    await this.ctx.database.set('chiral_verify_records', record.id, { failRounds })
+  }
+
+  /** 只更新答题次数（验证失败但还要禁言重试时，记录保持 pending） */
+  async updateVerifyRecordAttempts(guildId: string, userId: string, attempts: number): Promise<void> {
+    const record = await this.getPendingRecord(guildId, userId)
+    if (!record) return
+    await this.ctx.database.set('chiral_verify_records', record.id, { attempts })
+  }
+
+  /** 更新验证记录状态（取当前 pending 的那条） */
   async updateVerifyRecordStatus(
     guildId: string,
     userId: string,
     status: VerifyStatus,
     attempts?: number
   ): Promise<void> {
-    const records = await this.ctx.database.get('chiral_verify_records', {
-      guildId,
-      userId,
-      status: VerifyStatus.PENDING,
+    const record = await this.getPendingRecord(guildId, userId)
+    if (!record) return
+
+    await this.ctx.database.set('chiral_verify_records', record.id, {
+      status,
+      completedAt: Date.now(),
+      notBefore: 0,
+      ...(attempts !== undefined ? { attempts } : {}),
     })
-    
-    if (records.length > 0) {
-      const record = records[records.length - 1] // 取最新的
-      await this.ctx.database.set('chiral_verify_records', record.id, {
-        status,
-        completedAt: Date.now(),
-        ...(attempts !== undefined ? { attempts } : {}),
-      })
-    }
+  }
+
+  /** 设置等待期（禁言到期时间戳）；重启后据此恢复定时器 */
+  async setNotBefore(guildId: string, userId: string, notBefore: number): Promise<void> {
+    const record = await this.getPendingRecord(guildId, userId)
+    if (!record) return
+    await this.ctx.database.set('chiral_verify_records', record.id, { notBefore })
+  }
+
+  /** 取所有未完成的验证记录（重启恢复用） */
+  async getPendingRecords(): Promise<VerifyRecord[]> {
+    return await this.ctx.database.get('chiral_verify_records', { status: VerifyStatus.PENDING })
   }
 
   /** 获取用户验证历史 */
@@ -88,7 +192,7 @@ export class DatabaseService {
     expired: number
   }> {
     const records = await this.ctx.database.get('chiral_verify_records', { guildId })
-    
+
     return {
       total: records.length,
       passed: records.filter(r => r.status === VerifyStatus.PASSED).length,
@@ -102,13 +206,13 @@ export class DatabaseService {
     const oldRecords = await this.ctx.database.get('chiral_verify_records', {
       createdAt: { $lt: beforeTimestamp },
     })
-    
+
     if (oldRecords.length > 0) {
       await this.ctx.database.remove('chiral_verify_records', {
         createdAt: { $lt: beforeTimestamp },
       })
     }
-    
+
     return oldRecords.length
   }
 
@@ -123,7 +227,7 @@ export class DatabaseService {
   /** 保存群配置 */
   async saveGroupConfig(config: GroupConfig): Promise<void> {
     const existing = await this.getGroupConfig(config.guildId)
-    
+
     if (existing) {
       await this.ctx.database.set('chiral_group_configs', { guildId: config.guildId }, {
         enabled: config.enabled,
