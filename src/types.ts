@@ -149,6 +149,7 @@ export interface Config {
     memberLeft: string
     bypassSuccess: string
     verifyBanned: string
+    webPrompt: string
   }
 }
 
@@ -346,6 +347,10 @@ export const Config: Schema<Config> = Schema.intersect([
       verifyBanned: Schema.string()
         .default('验证失败，你已被禁言 {minutes} 分钟\n禁言结束后会自动发新题目，届时请重新作答~')
         .description('🚫 验证失败被禁言时的文案，可用变量: {minutes}'),
+      webPrompt: Schema.string()
+        .role('textarea')
+        .default('欢迎进群～为了防广告，进群后需要先验证一下\n你已被暂时禁言 {banText}，验证通过会自动解禁\n请点下面的按钮或打开网页作答，题目和选项都在网页里\n（每轮 {maxAttempts} 次机会，用完要等 {cooldown} 分钟）')
+        .description('🌐 网页验证模式的进群提示，和链接一起发。可用变量: {banText} {minutes} {url} {maxAttempts} {cooldown}'),
     }).description('📝 自定义文案配置'),
   }).description('💬 自定义文案'),
 ])

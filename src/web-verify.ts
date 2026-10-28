@@ -2,7 +2,7 @@ import { Context, Logger, h } from 'koishi'
 import { createServer, IncomingMessage, Server, ServerResponse } from 'node:http'
 import { Config, VerifyStatus, VerifyType, VerifyRecord } from './types'
 import { DatabaseService } from './database'
-import { Verifier } from './verifier'
+import { Verifier, renderTemplate } from './verifier'
 import { linkButton } from './qq-button'
 
 const logger = new Logger('chiral-carbon-verifier:web')
@@ -60,6 +60,14 @@ export class WebVerifier {
     return Math.max(1, Math.round(this.config.webBanMinutes ?? 43200))
   }
 
+  /** 禁言时长的中文描述，塞进提示文案的 {banText} */
+  get banText(): string {
+    const minutes = this.banMinutes
+    if (minutes % 1440 === 0) return `${minutes / 1440} 天`
+    if (minutes >= 60) return `${Math.round(minutes / 60)} 小时`
+    return `${minutes} 分钟`
+  }
+
   /** 监听端口 */
   get port(): number {
     return Math.max(1, Math.round(this.config.webPort ?? 5140))
@@ -68,11 +76,11 @@ export class WebVerifier {
   // ==================== 入群：静默禁言 + 只发链接 ====================
 
   /**
-   * 网页验证模式的入群处理（**静默**）：
+   * 网页验证模式的入群处理：
    * 1. 先禁言（默认 30 天，验证通过自动解禁，防广告）
    * 2. 建一条 pending 记录（重启后靠它继续认人）
-   * 3. 群里**只发一条链接消息**（QQ 上带一个跳转按钮），不 @ 人、不提示、不刷屏；
-   *    后续所有提示（答错剩几次、冷却、通过）全部在网页里显示。
+   * 3. 发**一条**消息：@ 人 + 提示语 + 链接（QQ 上再带一个跳转按钮，点了直接开网页）
+   *    之后的答错 / 冷却 / 通过提示都只在网页里显示，群里不再刷屏。
    */
   async startWebVerify(target: {
     guildId: string
@@ -98,10 +106,23 @@ export class WebVerifier {
     const url = this.buildUrl(userId)
     const isQQ = /^qq(bot)?(-|$)/i.test(platform)
 
-    // 只发链接：QQ 上给一个跳转按钮（点了直接开网页），其它平台就是纯链接
-    const message: h[] = isQQ && this.config.verifyButtons
-      ? [linkButton(url, '🌐 点我验证'), h.text(url)]
-      : [h.text(url)]
+    const promptText = renderTemplate(this.config.messages.webPrompt, {
+      banText: this.banText,
+      minutes: this.banMinutes,
+      url,
+      maxAttempts: this.config.webMaxAttempts,
+      cooldown: this.config.webCooldownMinutes,
+    })
+
+    // @ 人 + 提示语 + 链接（一个都不过滤）
+    // 提示语里已经写了 {url} 的话就别重复贴一次链接
+    const message: h[] = [h.at(userId), h.text('\n' + promptText)]
+    if (!promptText.includes(url)) message.push(h.text('\n' + url))
+
+    // QQ 上再加一个跳转按钮，点一下直接打开网页
+    if (isQQ && this.config.verifyButtons) {
+      message.push(linkButton(url, '🌐 点我验证'))
+    }
 
     const ids = await target.send(message)
     if (!ids) {
