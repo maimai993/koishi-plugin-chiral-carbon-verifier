@@ -3,6 +3,7 @@ import { Config } from './types'
 import { extendDatabase, DatabaseService } from './database'
 import { Verifier } from './verifier'
 import { registerEvents } from './events'
+import { WebVerifier } from './web-verify'
 import { registerCommands } from './commands'
 import { readFileSync } from 'fs'
 import { resolve } from 'path'
@@ -100,8 +101,15 @@ export function apply(ctx: Context, config: Config) {
   const db = new DatabaseService(ctx)
   const verifier = new Verifier(ctx, config, db)
 
+  // 网页验证（verifyMode = web）：独占一个端口起独立的 HTTP 服务，路由是 /<openid>
+  const webVerifier = new WebVerifier(ctx, config, db, verifier)
+  if (config.verifyMode === 'web') {
+    webVerifier.apply()
+    ctx.on('dispose', () => webVerifier.stop())
+  }
+
   // 注册事件监听器
-  const utils = registerEvents(ctx, config, db, verifier)
+  const utils = registerEvents(ctx, config, db, verifier, webVerifier)
 
   // 注册命令
   registerCommands(ctx, config, db, verifier, utils)

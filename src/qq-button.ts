@@ -32,6 +32,8 @@ const REGION_PREFIX = 'ccv:a:'
 
 /** 回调按钮（action.type = 1） */
 const ACTION_TYPE_CALLBACK = 1
+/** 跳转按钮（action.type = 0）：点了直接打开 http 网页 */
+const ACTION_TYPE_LINK = 0
 /** 权限：所有人可点 */
 const PERMISSION_EVERYONE = 2
 
@@ -125,4 +127,28 @@ export function clearButton(label = '🧹 清空'): h {
     label,
     style: BUTTON_STYLE_GREY,
   })
+}
+
+/**
+ * 跳转按钮（`action.type = 0`）：点一下直接打开网页。
+ *
+ * 网页验证模式用它 —— 进群先禁言，发一条提示 + 这个按钮，
+ * 用户点按钮打开 `<webServer>/<openid>` 在网页里作答，群里不会一直刷屏。
+ */
+export function linkButton(url: string, label = '🌐 点我验证'): h {
+  const element: any = h('button', {
+    id: 'ccv-link',
+    render_data: { label, visited_label: label, style: BUTTON_STYLE_BLUE },
+    action: {
+      type: ACTION_TYPE_LINK,
+      permission: { type: PERMISSION_EVERYONE },
+      data: url,
+      unsupport_tips: `当前QQ版本不支持按钮，请手动打开链接：${url}`,
+    },
+  }, label)
+
+  const attrs = element.attrs ?? {}
+  if (attrs.renderData && !attrs.render_data) attrs.render_data = attrs.renderData
+
+  return element as h
 }

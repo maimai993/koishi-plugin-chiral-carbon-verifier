@@ -1,12 +1,11 @@
 import { Context, Logger, h } from 'koishi'
 import { Config, VerifyType, VerifySession, VerifyStatus, GroupConfig } from './types'
 import { DatabaseService } from './database'
-import { buildMarkdownImage, imageDataUri, isMarkdownImagePlatform, base64ToBuffer } from './markdown-image'
+import { buildMarkdownImage, imageDataUri, isMarkdownImagePlatform } from './markdown-image'
 import { regionButton, submitButton, clearButton, parseButtonRegions } from './qq-button'
-import { detectRegionLabels } from './grid-detect'
 
-/** 识别不出网格时的兜底区域代号（A–E 列 × 1–3 行） */
-const DEFAULT_BUTTON_REGIONS = 'A1,A2,A3,B1,B2,B3,C1,C2,C3,D1,D2,D3,E1,E2,E3'
+/** 默认区域代号（A–E 列 × 1–3 行，题目图最大就到 E3） */
+export const DEFAULT_BUTTON_REGIONS = 'A1,A2,A3,B1,B2,B3,C1,C2,C3,D1,D2,D3,E1,E2,E3'
 
 const logger = new Logger('chiral-carbon-verifier:verifier')
 
@@ -208,7 +207,7 @@ export class Verifier {
                   h('markdown', {}, `${mdImage.markdown}\n\n${promptText}`),
                   // QQ 上再带一组回调按钮：点区域代号即作答（只有本人点了才有反应）
                   ...(this.config.verifyButtons
-                    ? this.buildRegionButtons(this.resolveRegionLabels(carbonResult.base64), [], groupConfig.hardMode)
+                    ? this.buildRegionButtons(this.getRegionLabels(), [], groupConfig.hardMode)
                     : []),
                 ],
                 fallbackMessage: plainMessage,
@@ -306,31 +305,11 @@ export class Verifier {
   }
 
   /**
-   * 按钮上要摆哪些区域代号：
-   * - `buttonRegions = auto`（默认）：**从题目图里数格子**——图上按棋盘格配色（相邻格子异色、斜对角同色，
-   *   也就是 A1 与 B2 同色、B1 与 A2 同色），套不同行列数看哪种切分最自洽，就能得出 5 列 × 3 行 → A1…E3；
-   * - 配置里写了具体代号：直接用配置的；
-   * - 识别失败：退回配置/默认的 A1…E3。
+   * 按钮上要摆哪些区域代号：直接用配置里的列表（默认 A1…E3 一共 15 个，题目图最大就到 E3）。
    */
-  private resolveRegionLabels(base64: string): string[] {
-    const configured = (this.config.buttonRegions ?? '').trim()
-    const isAuto = !configured || /^auto$/i.test(configured)
-
-    if (!isAuto) return parseButtonRegions(configured)
-
-    try {
-      const buffer = base64ToBuffer(base64)
-      const labels = buffer ? detectRegionLabels(buffer) : null
-      if (labels?.length) {
-        logger.info(`从题目图识别到 ${labels.length} 个区域格子（${labels[0]} … ${labels[labels.length - 1]}）`)
-        return labels
-      }
-      logger.warn('题目图网格识别失败，退回配置里的默认区域代号')
-    } catch (error) {
-      logger.warn('题目图网格识别异常，退回配置里的默认区域代号:', error)
-    }
-
-    return parseButtonRegions(DEFAULT_BUTTON_REGIONS)
+  getRegionLabels(): string[] {
+    const codes = parseButtonRegions(this.config.buttonRegions)
+    return codes.length ? codes : parseButtonRegions(DEFAULT_BUTTON_REGIONS)
   }
 
   /** 点选一个区域（困难模式累积，简单模式也是走这个再立即提交） */
@@ -413,6 +392,88 @@ export class Verifier {
       logger.error('手性碳 API 请求失败:', error)
       throw error
     }
+  }
+
+  /**
+   * 出一道题但**不建群内会话**（网页验证用）：
+   * 返回题目内容（手性碳图 + 正确区域，或数字表达式 + 答案），判定逻辑由网页自己走。
+   */
+  async createWebQuestion(guildId: string): Promise<{
+    type: VerifyType
+    imageBase64?: string
+    regions?: string[]
+    expression?: string
+    answer?: number
+    prompt: string
+  }> {
+    const groupConfig = await this.getGroupConfig(guildId)
+
+    if (groupConfig.useCarbonMode) {
+      try {
+        const carbonResult = await this.fetchCarbonQuestion(groupConfig.showHint)
+        if (carbonResult) {
+          const regionCount = carbonResult.regions.length
+          const modeHint = groupConfig.hardMode
+            ? '全部含有手性碳的区域'
+            : '其中任意一块包含手性碳的区域'
+
+          return {
+            type: VerifyType.CARBON,
+            imageBase64: carbonResult.base64,
+            regions: carbonResult.regions,
+            prompt: renderTemplate(this.config.messages.carbonPrompt, {
+              timeout: this.config.verifyTimeout,
+              timeoutText: timeoutText(this.config.verifyTimeout),
+              modeHint,
+              regionCount,
+            }),
+          }
+        }
+      } catch (error) {
+        logger.warn('手性碳 API 请求失败，网页验证降级为数字验证:', error)
+      }
+    }
+
+    // 降级数字题
+    const a = Math.floor(Math.random() * 100)
+    const b = Math.floor(Math.random() * 100)
+    const op = Math.random() > 0.5 ? '+' : '-'
+
+    return {
+      type: VerifyType.MATH,
+      expression: `${a} ${op} ${b}`,
+      answer: op === '+' ? a + b : a - b,
+      prompt: renderTemplate(this.config.messages.mathPrompt, {
+        timeout: this.config.verifyTimeout,
+        timeoutText: timeoutText(this.config.verifyTimeout),
+        expression: `${a} ${op} ${b}`,
+      }),
+    }
+  }
+
+  /**
+   * 判定网页里提交的答案。逻辑和群内作答一致（含「混入错误区域直接判错」）。
+   */
+  async checkWebAnswer(
+    guildId: string,
+    question: { type: VerifyType; regions?: string[]; answer?: number },
+    userAnswer: string
+  ): Promise<boolean> {
+    if (question.type === VerifyType.MATH) {
+      const num = parseInt((userAnswer ?? '').trim(), 10)
+      return !Number.isNaN(num) && num === question.answer
+    }
+
+    const groupConfig = await this.getGroupConfig(guildId)
+    const correctRegions = Array.from(
+      new Set((question.regions ?? []).map((r) => r.trim().toUpperCase()).filter(Boolean))
+    )
+    const userRegions = parseUserRegions(userAnswer, correctRegions)
+
+    if (!userRegions.length) return false
+    if (userRegions.some((r) => !correctRegions.includes(r))) return false
+    if (groupConfig.hardMode) return correctRegions.every((r) => userRegions.includes(r))
+    return true
   }
 
   /** 验证答案 */

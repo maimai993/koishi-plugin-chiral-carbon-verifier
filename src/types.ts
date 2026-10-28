@@ -34,6 +34,9 @@ export interface GroupConfig {
   showHint: boolean
 }
 
+/** 🔬 验证方式 */
+export type VerifyMode = 'message' | 'web'
+
 /** 🧠 验证会话（内存中的验证状态） */
 export interface VerifySession {
   /** 🏷️ 群号 */
@@ -72,6 +75,8 @@ export interface VerifyRecord {
   expiresAt: number
   /** 等待期结束时间戳（禁言到期后重新发题目）；0 表示没有等待期 */
   notBefore: number
+  /** 网页验证：本轮已提交次数 */
+  webAttempts: number
   completedAt?: number
 }
 
@@ -98,6 +103,18 @@ export interface Config {
   verifyTimeout: number
   /** 🔢 最大尝试次数 */
   maxAttempts: number
+  /** 🔬 验证方式：message 群内作答 / web 网页作答（进群先禁言，点链接去网页答） */
+  verifyMode: VerifyMode
+  /** 🌐 网页验证的服务器地址，如 https://verify.example.com（最终地址 = 服务器地址/openid） */
+  webServer: string
+  /** 🔌 网页验证独占的端口（插件自己起一个 HTTP 服务，不占用 koishi 的端口） */
+  webPort: number
+  /** 🚫 网页验证模式下进群先禁言多久（分钟），默认 43200 = 30 天 */
+  webBanMinutes: number
+  /** 🔢 网页验证每次冷却前允许作答的次数 */
+  webMaxAttempts: number
+  /** ⏳ 网页验证次数用完后冷却多久（分钟） */
+  webCooldownMinutes: number
   /** 🗑️ 是否撤回错误回答 */
   recallWrongAnswer: boolean
   /** 👢 验证失败处理方式：none 不处理 / kick 踢出群 / ban 禁言后重试 */
@@ -167,7 +184,13 @@ export const Config: Schema<Config> = Schema.intersect([
       .min(0)
       .max(600)
       .step(10)
-      .description('⏳ 验证超时时间（秒），填 0 表示**不限时**（不会超时，也不会因为超时踢人/禁言）'),
+      .description('⏳ 验证超时时间（秒），填 0 表示**不限时**（不会超时，也不会因为超时踢人/禁言）。网页验证模式下这个时间不生效（页面不过期）'),
+    verifyMode: Schema.union([
+      Schema.const('message').description('💬 群内作答：机器人发题目，用户在群里发区域代号 / 点按钮'),
+      Schema.const('web').description('🌐 网页作答：进群先禁言，发提示 + 按钮，点开网页在网页里选题（不刷屏）'),
+    ])
+      .default('message')
+      .description('🔬 验证方式（可随时切换）'),
     maxAttempts: Schema.number()
       .default(3)
       .min(1)
@@ -204,8 +227,8 @@ export const Config: Schema<Config> = Schema.intersect([
       .description('🔘 QQ 平台在题目消息里附带区域代号按钮（A1、B2…），点按钮即作答；只有正在验证的那个人点了才有反应（需要 qq-crack 这类支持 INTERACTION_CREATE 的适配器）'),
     buttonRegions: Schema.string()
       .role('textarea')
-      .default('auto')
-      .description('🎛️ 按钮上的候选区域代号。`auto`（默认）= 从题目图里按棋盘格配色自动数格子（相邻格子异色、斜对角同色 → 能得出 5 列 × 3 行 = A1…E3）；也可以直接填一串代号覆盖它，如 `A1,A2,A3,B1,B2,B3,C1,C2,C3,D1,D2,D3`'),
+      .default('A1,A2,A3,B1,B2,B3,C1,C2,C3,D1,D2,D3,E1,E2,E3')
+      .description('🎛️ 题目按钮 / 网页选项上的候选区域代号（默认 A1–E3 共 15 个，题目图最大就到 E3），逗号分隔'),
     reminderBeforeTimeout: Schema.number()
       .default(60)
       .min(0)
@@ -219,6 +242,36 @@ export const Config: Schema<Config> = Schema.intersect([
       .step(1)
       .description('📅 重新验证允许的最大入群天数，入群超过该天数的成员将拒绝重新验证（0 为不限制）'),
   }).description('⏱️ 验证行为配置'),
+
+  Schema.object({
+    webServer: Schema.string()
+      .default('')
+      .description('🌐 网页验证的服务器地址，例如 `https://verify.example.com`（**换了 `verifyMode = web` 时必须填**）。最终验证地址 = `服务器地址/openid`，例如 `https://verify.example.com:5140/A1B2C3D4...`；如果端口对外开放，记得把端口也写进来'),
+    webPort: Schema.number()
+      .default(5140)
+      .min(1)
+      .max(65535)
+      .step(1)
+      .description('🔌 网页验证页面独占的端口：插件会单独起一个 HTTP 服务监听这个端口（和 koishi 主端口互不影响），记得在防火墙/反向代理里放行'),
+    webBanMinutes: Schema.number()
+      .default(43200)
+      .min(1)
+      .max(44640)
+      .step(1)
+      .description('🚫 网页验证模式下，新成员进群先禁言多少分钟（默认 43200 = 30 天，最多 44640 = 31 天），验证通过后自动解禁'),
+    webMaxAttempts: Schema.number()
+      .default(3)
+      .min(1)
+      .max(20)
+      .step(1)
+      .description('🔢 网页验证一轮里允许提交几次答案，用完就进入冷却'),
+    webCooldownMinutes: Schema.number()
+      .default(10)
+      .min(1)
+      .max(1440)
+      .step(1)
+      .description('⏳ 网页验证次数用完后冷却多少分钟才能再试（冷却期间打开网页只显示剩余时间）'),
+  }).description('🌐 网页验证（verifyMode = web 时生效）'),
 
   Schema.object({
     masterAccounts: Schema.array(Schema.object({

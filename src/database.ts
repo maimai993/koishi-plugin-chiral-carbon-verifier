@@ -1,5 +1,5 @@
 import { Context } from 'koishi'
-import { VerifyRecord, VerifyStatus, GroupConfig } from './types'
+import { VerifyRecord, VerifyStatus, VerifyType, GroupConfig } from './types'
 
 /** 扩展数据库模型 */
 export function extendDatabase(ctx: Context) {
@@ -21,6 +21,8 @@ export function extendDatabase(ctx: Context) {
     expiresAt: 'unsigned',
     /** 等待期结束时间戳：禁言到期后再重新发题目；0 表示没有等待期 */
     notBefore: 'unsigned',
+    /** 网页验证：本轮已提交次数（用完进入冷却） */
+    webAttempts: 'unsigned',
     completedAt: 'unsigned',
   }, {
     autoInc: true,
@@ -168,6 +170,44 @@ export class DatabaseService {
   /** 取所有未完成的验证记录（重启恢复用） */
   async getPendingRecords(): Promise<VerifyRecord[]> {
     return await this.ctx.database.get('chiral_verify_records', { status: VerifyStatus.PENDING })
+  }
+
+  // ==================== 网页验证专用 ====================
+
+  /** 按 userId 找未完成的网页验证记录（网页地址里只有 openid，靠这个反查是哪个群） */
+  async getPendingWebRecords(userId: string): Promise<VerifyRecord[]> {
+    const records = await this.ctx.database.get('chiral_verify_records', {
+      userId,
+      type: VerifyType.CARBON,
+      status: VerifyStatus.PENDING,
+    })
+    return records
+  }
+
+  /** 按 userId 找**任意状态**的网页验证记录（判断是不是「已验证通过」） */
+  async getWebRecordsByUser(userId: string): Promise<VerifyRecord[]> {
+    return await this.ctx.database
+      .select('chiral_verify_records')
+      .where({ userId })
+      .orderBy('createdAt', 'desc')
+      .limit(5)
+      .execute()
+  }
+
+  /** 网页验证：记一次提交（次数 + 冷却时间） */
+  async setWebState(recordId: number, state: { webAttempts?: number; notBefore?: number }): Promise<void> {
+    await this.ctx.database.set('chiral_verify_records', recordId, state)
+  }
+
+  /** 网页验证通过：标记记录 + 清冷却 */
+  async passWebRecord(recordId: number, attempts: number): Promise<void> {
+    await this.ctx.database.set('chiral_verify_records', recordId, {
+      status: VerifyStatus.PASSED,
+      attempts,
+      webAttempts: 0,
+      notBefore: 0,
+      completedAt: Date.now(),
+    })
   }
 
   /** 获取用户验证历史 */
