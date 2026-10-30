@@ -52,6 +52,15 @@ export class WebVerifier {
 
   /** 配置是否可用（没填服务器地址就没法做网页验证；quiz/captcha 各自还有前置条件） */
   isReady(): boolean {
+    // 服务没起来（端口占用 / 服务未启动）→ 网页一定打不开，直接退回群内并说清楚
+    if (!this.listening) {
+      logger.warn(
+        `网页验证服务当前没有在监听端口（配置端口 ${this.port}），网页会打不开（反代会返回 502），` +
+          '本次退回群内作答。请检查日志里的端口占用报错，或换一个「网页验证端口」'
+      )
+      return false
+    }
+
     const base = (this.config.webServer ?? '').trim()
     if (!/^https?:\/\//i.test(base)) {
       logger.warn('网页验证需要先在配置里填写「服务器地址」（如 https://verify.example.com:5140），本次退回群内作答')
@@ -59,7 +68,7 @@ export class WebVerifier {
     }
 
     if (this.config.verifyMode === 'quiz' && !(this.config.quizQuestions ?? []).length) {
-      logger.warn('问卷模式（quiz）需要在配置里至少添加一道问卷题目，本次退回群内作答')
+      logger.warn('问卷模式（quiz）需要在配置里至少添加一道问卷题目（题目 → 选项 → 是否正确填 1/0），本次退回群内作答')
       return false
     }
 
@@ -68,8 +77,8 @@ export class WebVerifier {
       return false
     }
 
-    if (this.config.verifyMode === 'captcha' && !(this.config.cfSiteKey ?? '').trim()) {
-      logger.warn('纯人机验证模式（captcha）需要填写 Turnstile Sitekey，本次退回群内作答')
+    if (this.config.cfTurnstile && !(this.config.cfSiteKey ?? '').trim()) {
+      logger.warn('已启用 Turnstile 但没填 Sitekey，页面不会显示人机验证组件，本次退回群内作答')
       return false
     }
 
@@ -185,6 +194,17 @@ export class WebVerifier {
 
   // ==================== 独立端口的 HTTP 服务 ====================
 
+  /** 端口是否已经真的在监听（页面能访问的前提） */
+  get listening(): boolean {
+    return !!this.server?.listening
+  }
+
+  /** 当前实际监听的端口（换端口兜底后会变） */
+  get listeningPort(): number {
+    const address = this.server?.address()
+    return address && typeof address === 'object' ? address.port : this.port
+  }
+
   /** 启动网页服务（独占配置里的端口） */
   apply(): void {
     if (this.server) return
@@ -199,16 +219,44 @@ export class WebVerifier {
       })
     })
 
+    // 端口被占用时自动往后找 10 个端口，避免「静默 502」（反代连不上一个没起来的服务）
+    let retried = 0
+    const maxRetry = 10
+
     server.on('error', (error: any) => {
       if (error?.code === 'EADDRINUSE') {
-        logger.error(`网页验证端口 ${this.port} 已被占用，请改配置里的「网页验证端口」`)
-      } else {
-        logger.error(`网页验证服务启动失败（端口 ${this.port}）:`, error)
+        if (retried < maxRetry) {
+          retried++
+          const next = this.port + retried
+          logger.warn(`网页验证端口 ${next - 1} 已被占用，尝试改用 ${next} 端口…`)
+          setTimeout(() => server.listen(next), 300)
+          return
+        }
+        logger.error(
+          `网页验证端口 ${this.port}~${this.port + maxRetry} 全被占用，无法启动网页验证！` +
+            '请改配置里的「网页验证端口」，否则反代会一直返回 502'
+        )
+        return
       }
+
+      if (error?.code === 'EACCES') {
+        logger.error(`没有权限监听端口 ${this.port}（1024 以下的端口需要管理员/root 权限），请换一个大于 1024 的端口`)
+        return
+      }
+
+      logger.error(`网页验证服务启动失败（端口 ${this.port}）:`, error)
     })
 
     server.listen(this.port, () => {
-      logger.info(`网页验证服务已启动：监听 ${this.port} 端口（访问地址 = 配置的服务器地址 + /openid）`)
+      const actual = this.listeningPort
+      const mismatch = actual !== this.port ? `（配置的是 ${this.port}，已自动改用 ${actual}）` : ''
+      logger.info(
+        `网页验证服务已启动：监听 ${actual} 端口${mismatch}｜网页类验证方式 = ${this.config.verifyMode}｜` +
+          `访问地址 = ${(this.config.webServer ?? '').trim()}/openid`
+      )
+      logger.info(
+        `如果外部访问出现 502，请确认反向代理指向的是 127.0.0.1:${actual}，并且 webServer 填的域名能解析到这台机器`
+      )
     })
 
     this.server = server
@@ -228,6 +276,20 @@ export class WebVerifier {
     const index = rawUrl.indexOf('?')
     const pathname = index >= 0 ? rawUrl.slice(0, index) : rawUrl
     const search = new URLSearchParams(index >= 0 ? rawUrl.slice(index + 1) : '')
+
+    // 自检页：确认服务和反代都通（浏览器打开 服务器地址/health 看到 JSON 就说明链路没问题）
+    if (pathname === '/health' || pathname === '/health/') {
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+      res.end(JSON.stringify({
+        ok: true,
+        plugin: 'koishi-plugin-chiral-carbon-verifier',
+        verifyMode: this.config.verifyMode,
+        port: this.listeningPort,
+        cfTurnstile: !!this.config.cfTurnstile,
+        time: new Date().toISOString(),
+      }))
+      return
+    }
 
     const match = /^\/([A-Za-z0-9_-]{6,64})\/?$/.exec(pathname)
     if (!match) {

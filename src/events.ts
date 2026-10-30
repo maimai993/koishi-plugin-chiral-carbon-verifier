@@ -433,9 +433,9 @@ export class EventUtils {
     let resumed = 0
 
     for (const record of records) {
-      // 网页验证模式的记录：靠网页自己做，不需要重发题目
-      if (this.config.verifyMode === 'web') {
-        logger.info(`用户 ${record.userId} 的验证是网页验证模式，跳过群内重发`)
+      // 网页类验证模式的记录：靠网页自己做，不需要重发题目
+      if (this.config.verifyMode !== 'message') {
+        logger.info(`用户 ${record.userId} 的验证是网页类模式（${this.config.verifyMode}），跳过群内重发`)
         continue
       }
 
@@ -518,9 +518,9 @@ export function registerEvents(
     // 用户重新入群时，取消旧的「等待结束后重新验证」定时器
     utils.cancelReverify(guildId, userId)
 
-    // 网页验证模式：进群先禁言（默认 30 天），发提示 + 跳转按钮，让用户去网页做题
-    if (config.verifyMode === 'web' && web?.isReady()) {
-      logger.info(`开始对用户 ${userId} 进行网页验证`)
+    // 网页类验证模式（web / quiz / captcha）：进群先禁言（默认 30 天），发提示 + 跳转按钮，让用户去网页做题
+    if (config.verifyMode !== 'message' && web?.isReady()) {
+      logger.info(`开始对用户 ${userId} 进行网页类验证（${config.verifyMode}）`)
       await web.startWebVerify({
         guildId,
         platform,

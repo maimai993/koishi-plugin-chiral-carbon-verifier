@@ -101,9 +101,10 @@ export function apply(ctx: Context, config: Config) {
   const db = new DatabaseService(ctx)
   const verifier = new Verifier(ctx, config, db)
 
-  // 网页验证（verifyMode = web）：独占一个端口起独立的 HTTP 服务，路由是 /<openid>
+  // 网页类验证（web / quiz / captcha）：独占一个端口起独立的 HTTP 服务，路由是 /<openid>
+  // 三种模式共用同一个页面服务，所以只要不是群内作答就都得把端口起起来
   const webVerifier = new WebVerifier(ctx, config, db, verifier)
-  if (config.verifyMode === 'web') {
+  if (config.verifyMode !== 'message') {
     webVerifier.apply()
     ctx.on('dispose', () => webVerifier.stop())
   }
