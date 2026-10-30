@@ -21,6 +21,9 @@ interface WebQuestion {
 /** 题目缓存有效期：10 分钟（刷新页面沿用同一道题） */
 const QUESTION_TTL = 10 * 60 * 1000
 
+/** 人机验证通过后的有效时间：2 小时（这期间刷新页面不用再验一次） */
+const HUMAN_CHECK_TTL = 2 * 60 * 60 * 1000
+
 /**
  * 网页验证：
  * - 进群**静默**禁言（默认 30 天），群里只发一条链接（QQ 上带跳转按钮），其它什么都不发
@@ -30,6 +33,8 @@ const QUESTION_TTL = 10 * 60 * 1000
  */
 export class WebVerifier {
   private questions = new Map<string, WebQuestion>()
+  /** 已经通过人机验证的 openid → 过期时间戳 */
+  private humanChecks = new Map<string, number>()
   private server?: Server<typeof IncomingMessage, typeof ServerResponse>
 
   constructor(
@@ -279,7 +284,17 @@ export class WebVerifier {
 
       if (result?.success) return true
 
-      logger.warn(`Turnstile 校验失败: ${JSON.stringify(result?.['error-codes'] ?? result)}`)
+      const codes: string[] = result?.['error-codes'] ?? []
+      const hostname = result?.hostname ? ` hostname=${result.hostname}` : ''
+      logger.warn(`Turnstile 校验失败: ${JSON.stringify(codes)}${hostname}`)
+      if (codes.includes('invalid-input-secret')) {
+        logger.warn('  → Secret Key 不对（粘贴错 / 已删除 / 和 Sitekey 不是同一个 Widget）')
+      } else if (codes.includes('invalid-input-response')) {
+        logger.warn('  → token 无效或已过期：最常见原因是 Widget 的 Hostname 里没包含当前访问的域名，' +
+          '导致前端拿不到真 token。去 Cloudflare 控制台 → Turnstile → 你的 Widget → Settings → Hostnames 加上域名')
+      } else if (codes.includes('timeout-or-duplicate')) {
+        logger.warn('  → token 只能使用一次，刷新页面重新验证即可')
+      }
       return false
     } catch (error) {
       logger.error('Turnstile 校验请求失败:', error)
@@ -343,18 +358,37 @@ export class WebVerifier {
     const attempts = Number(record.webAttempts ?? 0)
     const left = Math.max(0, Math.max(1, this.config.webMaxAttempts) - attempts)
 
+    // 第一步：启用了 Turnstile 就先只显示人机验证，过了才给题目 / 问卷
+    if (this.needHumanCheck(opid)) {
+      this.sendHtml(res, 200, this.renderCaptchaPage(record.guildId, opid))
+      return
+    }
+
     // 按验证方式出页面
     if (this.config.verifyMode === 'quiz') {
       this.sendHtml(res, 200, this.renderQuizPage(record.guildId, opid, left))
       return
     }
     if (this.config.verifyMode === 'captcha') {
+      // captcha 模式理论上在上面已经过了人机验证，这里兜底再显示一次
       this.sendHtml(res, 200, this.renderCaptchaPage(record.guildId, opid))
       return
     }
 
     const question = await this.getQuestion(record.guildId, opid)
     this.sendHtml(res, 200, this.renderQuestionPage(record.guildId, question, left))
+  }
+
+  /** 这个人是不是还需要先过人机验证（启用了 Turnstile 且还没过 / 已过期） */
+  private needHumanCheck(opid: string): boolean {
+    if (!this.config.cfTurnstile) return false
+    const expiredAt = this.humanChecks.get(opid) ?? 0
+    return expiredAt <= Date.now()
+  }
+
+  /** 标记这个人已经通过人机验证（有效期 2 小时，够答完题） */
+  private markHumanPassed(opid: string): void {
+    this.humanChecks.set(opid, Date.now() + HUMAN_CHECK_TTL)
   }
 
   /** POST：提交答案 */
@@ -381,28 +415,38 @@ export class WebVerifier {
       return
     }
 
-    // captcha 模式：只看人机验证
-    if (this.config.verifyMode === 'captcha') {
+    // ===== 第一阶段：还没过人机验证的，这次提交只当作人机验证 =====
+    if (this.needHumanCheck(opid) || this.config.verifyMode === 'captcha') {
       const human = await this.verifyTurnstile(turnstileToken)
       if (!human) {
-        this.sendHtml(res, 200, this.renderCaptchaPage(record.guildId, opid, '人机验证没通过，请再试一次'))
+        this.sendHtml(res, 200, this.renderCaptchaPage(record.guildId, opid, this.turnstileFailHint()))
         return
       }
 
-      await this.db.passWebRecord(record.id, 1)
-      await this.unmuteAndPass(opid, record)
-      this.sendHtml(res, 200, this.simplePage('✅ 验证通过', '人机验证已完成，已自动解除禁言，回群里玩吧~'))
+      // 纯人机验证模式：过了就直接放行
+      if (this.config.verifyMode === 'captcha') {
+        await this.db.passWebRecord(record.id, 1)
+        await this.unmuteAndPass(opid, record)
+        this.sendHtml(res, 200, this.simplePage('✅ 验证通过', '人机验证已完成，已自动解除禁言，回群里玩吧~'))
+        return
+      }
+
+      // web / quiz：人机验证过了，接着显示题目 / 问卷
+      this.markHumanPassed(opid)
+      const attemptsNow = Number(record.webAttempts ?? 0)
+      const leftNow = Math.max(0, Math.max(1, this.config.webMaxAttempts) - attemptsNow)
+
+      if (this.config.verifyMode === 'quiz') {
+        this.sendHtml(res, 200, this.renderQuizPage(record.guildId, opid, leftNow))
+      } else {
+        const question = await this.getQuestion(record.guildId, opid)
+        this.sendHtml(res, 200, this.renderQuestionPage(record.guildId, question, leftNow))
+      }
       return
     }
 
     // quiz 模式：整卷判定（达成率）
     if (this.config.verifyMode === 'quiz') {
-      const human = await this.verifyTurnstile(turnstileToken)
-      if (!human) {
-        this.sendHtml(res, 200, this.renderQuizPage(record.guildId, opid, Math.max(1, this.config.webMaxAttempts), '人机验证没通过，请再试一次'))
-        return
-      }
-
       const passedQuiz = this.checkQuizAnswer(answer)
       const attempts = Number(record.webAttempts ?? 0) + 1
       const maxAttempts = Math.max(1, this.config.webMaxAttempts)
@@ -435,16 +479,6 @@ export class WebVerifier {
         200,
         this.simplePage('请先选择答案', `<p><a href="?g=${encodeURIComponent(record.guildId)}">← 返回题目</a></p>`)
       )
-      return
-    }
-
-    // Turnstile 校验（web 模式启用了才校验）
-    const human = await this.verifyTurnstile(turnstileToken)
-    if (!human) {
-      const attempts = Number(record.webAttempts ?? 0)
-      const left = Math.max(0, Math.max(1, this.config.webMaxAttempts) - attempts)
-      const question = await this.getQuestion(record.guildId, opid)
-      this.sendHtml(res, 200, this.renderQuestionPage(record.guildId, question, left, '人机验证没通过，请重试'))
       return
     }
 
@@ -552,6 +586,27 @@ export class WebVerifier {
 <div class="cf-turnstile" data-sitekey="${escapeHtml(siteKey)}"></div>`
   }
 
+  /** 人机验证失败时的提示（顺带给出常见原因，方便排查） */
+  private turnstileFailHint(): string {
+    const siteKey = (this.config.cfSiteKey ?? '').trim()
+    const host = (() => {
+      try {
+        return new URL((this.config.webServer ?? '').trim()).hostname
+      } catch {
+        return ''
+      }
+    })()
+
+    const hints = [
+      '人机验证没通过，请再点一次试试',
+      `小提示：Widget 的 Hostname 里必须包含当前访问的域名${host ? `（<code>${escapeHtml(host)}</code>）` : ''}，` +
+        '并且 Sitekey 和 Secret Key 必须来自**同一个** Widget。',
+    ]
+    if (siteKey.startsWith('0x')) hints.push('也可以先用测试密钥验证流程：Sitekey <code>1x00000000000000000000AA</code>、Secret <code>1x0000000000000000000000000000000AA</code>（永远通过）。')
+
+    return hints.join('<br>')
+  }
+
   /** 取 quiz 题目：把配置的选项表格整理成 { 文本, 是否正确 } 列表 */
   private getQuizQuestions() {
     return (this.config.quizQuestions ?? []).map((q) => {
@@ -628,7 +683,6 @@ ${notice ? `<p class="notice">${escapeHtml(notice)}</p>` : ''}
 <p class="prompt">完成下面的问卷即可加入本群（达成率要求 <b>${Math.max(1, Math.min(100, Math.round(this.config.quizPassRate ?? 100)))}%</b>，多选题把所有正确选项都勾上）</p>
 <form method="POST" action="${action}">
 ${body}
-${this.turnstileWidget()}
 <button class="submit" type="submit">提交问卷</button>
 </form>
 <p class="hint">剩余机会：<b>${left}</b> 次 ｜ 答错太多次会进入冷却</p>
@@ -636,19 +690,23 @@ ${this.turnstileWidget()}
     })
   }
 
-  /** 纯人机验证页：只有 Turnstile */
+  /** 人机验证页（开屏第一个页面，只有 Turnstile，别的都不显示） */
   private renderCaptchaPage(guildId: string, opid: string, notice?: string): string {
     const action = `?g=${encodeURIComponent(guildId)}`
+    const isPure = this.config.verifyMode === 'captcha'
+    const subtitle = isPure
+      ? '完成人机验证即可入群，通过后自动解除禁言'
+      : '先完成人机验证，通过后才会显示题目'
 
     return this.renderPage({
       title: '人机验证',
       body: `<div class="card">
 <h1>🛡️ 人机验证</h1>
-${notice ? `<p class="notice">${escapeHtml(notice)}</p>` : ''}
-<p class="prompt">点击下面的复选框完成人机验证，通过后即可自动解除禁言</p>
+<p class="prompt">${subtitle}</p>
+${notice ? `<p class="notice">${notice}</p>` : ''}
 <form method="POST" action="${action}">
 ${this.turnstileWidget()}
-<button class="submit" type="submit">确认</button>
+<button class="submit" type="submit">${isPure ? '确认' : '继续'}</button>
 </form>
 </div>`,
     })
@@ -698,9 +756,6 @@ ${notice ? `<p class="notice">${escapeHtml(notice)}</p>` : ''}
 <p class="prompt">${escapeHtml(question.prompt).replace(/\n/g, '<br>')}</p>
 ${question.imageBase64 && !isMath ? `<div class="pic"><img src="data:image/png;base64,${question.imageBase64}" alt="题目图片"></div>` : ''}
 ${answerArea}
-<form method="POST" action="${action}">
-${this.turnstileWidget()}
-</form>
 <p class="hint">剩余机会：<b>${left}</b> 次 ｜ 答错太多次会进入冷却</p>
 </div>`,
     })

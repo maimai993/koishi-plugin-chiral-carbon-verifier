@@ -141,13 +141,23 @@ yarn add koishi-plugin-chiral-carbon-verifier
 | 配置项 | 说明 |
 |--------|------|
 | `cfTurnstile` | 是否启用 |
-| `cfSiteKey` | 站点密钥（下发到页面），调试可用 `1x00000000000000000000AA`（永远通过） |
-| `cfSecretKey` | 服务端密钥（只做后端校验），调试可用 `1x0000000000000000000000000000000AA`（永远通过） |
+| `cfSiteKey` | 站点密钥（下发到页面） |
+| `cfSecretKey` | 服务端密钥（只做后端校验） |
 
-配置步骤：Cloudflare 控制台 → Turnstile → Add Widget → **Hostname 填你 `webServer` 的域名**（域名不匹配会验证失败）→
-创建后把 Sitekey / Secret Key 填进插件配置。Widget 模式建议选 Managed。
+**流程是两段的**：开启后页面**开屏只有人机验证**（不显示题目、不显示选项），点了通过之后才出现题目 / 问卷；
+人机验证通过后 2 小时内刷新页面不用再验一次。人机验证没过不算答题次数，也不会解禁。
+
+配置步骤：Cloudflare 控制台 → Turnstile → Add Widget → **Hostname 填你 `webServer` 的域名**
+（例如 `yz.tangbot.xyz`；域名不匹配时前端拿不到 token，后端会一直报 `invalid-input-response`）→
+创建后把**同一个 Widget** 的 Sitekey / Secret Key 填进插件配置。Widget 模式建议选 Managed。
 
 > Secret Key 只在服务端校验用，永远不会出现在页面源码里。
+> 排查：日志里 `Turnstile 校验失败: ["invalid-input-response"]` = 域名没加对；
+> `["invalid-input-secret"]` = Secret 粘贴错或和 Sitekey 不来自同一个 Widget。
+>
+> 想先跑通流程可以用官方测试密钥（**永远通过、任意域名**）：
+> Sitekey `1x00000000000000000000AA`、Secret `1x0000000000000000000000000000000AA`。
+> 注意 `0x…` 开头的才是你自己的真实生产密钥，别把两个不同 Widget 的 key 混用。
 
 
 ### 主人账号配置
