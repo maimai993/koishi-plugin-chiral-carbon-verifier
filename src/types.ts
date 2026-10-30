@@ -37,14 +37,20 @@ export interface GroupConfig {
 /** 🔬 验证方式 */
 export type VerifyMode = 'message' | 'web' | 'quiz' | 'captcha'
 
-/** ❓ 问卷题目（quiz 模式用；options 为换行分隔的选项文本，correct 为从 1 开始的序号列表） */
+/** ❓ 问卷选项（表格里的一行） */
+export interface QuizOption {
+  /** 选项文本 */
+  text: string
+  /** 是否是正确答案：1 / 0（也可以写 是 / 否） */
+  correct: string
+}
+
+/** ❓ 问卷题目（quiz 模式用） */
 export interface QuizQuestion {
   /** 题干 */
   question: string
-  /** 选项，每行一个（存储层用换行分隔的字符串） */
-  options: string
-  /** 正确选项的序号（从 1 开始，逗号分隔，可多选） */
-  correct: string
+  /** 选项表格：每行一个选项 + 是否正确 */
+  options: QuizOption[]
 }
 
 /** 🧠 验证会话（内存中的验证状态） */
@@ -297,19 +303,22 @@ export const Config: Schema<Config> = Schema.intersect([
     quizQuestions: Schema.array(Schema.object({
       question: Schema.string()
         .role('textarea')
-        .description('❓ 题干')
+        .description('❓ 题干（这一题问什么）')
         .required(),
-      options: Schema.string()
-        .role('textarea')
-        .description('📝 选项，**每行一个**')
-        .required(),
-      correct: Schema.string()
-        .description('✅ 正确选项序号，从 1 开始，多选用逗号隔开（如 `2` 或 `1,3`）')
-        .required(),
+      options: Schema.array(Schema.object({
+        text: Schema.string()
+          .description('📝 选项内容')
+          .required(),
+        correct: Schema.string()
+          .default('0')
+          .description('✅ 是否正确答案：填 `1` = 正确，`0` = 错误（多选就让多个选项都填 1）'),
+      }))
+        .role('table')
+        .default([])
+        .description('📋 选项列表：一行一个选项，右边填 1 或 0 标记是不是正确答案'),
     }))
-      .role('table')
-      .default([])
-      .description('❓ 问卷题目列表（quiz 模式用；至少配 1 题才能用问卷模式）'),
+      .description('❓ 问卷题目（加几题就有几题；每题里面再加选项，勾 1 表示正确答案，可多选）')
+      .default([]),
     quizPassRate: Schema.number()
       .default(100)
       .min(1)

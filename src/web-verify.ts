@@ -510,7 +510,7 @@ export class WebVerifier {
     logger.info(`用户 ${opid} 网页验证通过（模式 ${this.config.verifyMode}），已解除禁言`)
   }
 
-  /** 判卷：按达成率算对了几题（answer 形如 `q0=1,2&q1=3`，选项序号从 1 开始） */
+  /** 判卷：按达成率算对了几题（answer 形如 `q0=0,2&q1=1`，值为选项下标） */
   private checkQuizAnswer(answer: string): boolean {
     const questions = this.getQuizQuestions()
     if (!questions.length) return false
@@ -519,13 +519,20 @@ export class WebVerifier {
     let correctCount = 0
 
     questions.forEach((q, index) => {
+      // 用户勾选的选项下标
       const picked = (params.get(`q${index}`) ?? '')
         .split(',')
         .map((v) => parseInt(v.trim(), 10))
-        .filter((v) => Number.isInteger(v) && v > 0)
-      const correct = [...q.correct].sort((a, b) => a - b).join(',')
+        .filter((v) => Number.isInteger(v) && v >= 0 && v < q.options.length)
+
+      // 正确答案的下标
+      const expected = q.options
+        .map((opt, i) => (opt.correct ? i : -1))
+        .filter((i) => i >= 0)
+
       const mine = [...new Set(picked)].sort((a, b) => a - b).join(',')
-      if (mine && mine === correct) correctCount++
+      const right = expected.sort((a, b) => a - b).join(',')
+      if (mine && mine === right) correctCount++
     })
 
     const rate = Math.round((correctCount / questions.length) * 100)
@@ -545,19 +552,17 @@ export class WebVerifier {
 <div class="cf-turnstile" data-sitekey="${escapeHtml(siteKey)}"></div>`
   }
 
-  /** 取 quiz 题目（把配置的多行文本拆成数组） */
+  /** 取 quiz 题目：把配置的选项表格整理成 { 文本, 是否正确 } 列表 */
   private getQuizQuestions() {
-    return (this.config.quizQuestions ?? []).map((q) => ({
-      question: q.question,
-      options: String(q.options ?? '')
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean),
-      correct: String(q.correct ?? '')
-        .split(/[,，\s]+/)
-        .map((v) => parseInt(v.trim(), 10))
-        .filter((v) => Number.isInteger(v) && v > 0),
-    }))
+    return (this.config.quizQuestions ?? []).map((q) => {
+      const options = (q.options ?? [])
+        .map((opt) => ({
+          text: String(opt?.text ?? '').trim(),
+          correct: isTruthyFlag(opt?.correct),
+        }))
+        .filter((opt) => opt.text)
+      return { question: String(q.question ?? '').trim(), options }
+    })
   }
 
   /** 取 / 生成题目：10 分钟内沿用同一道题 */
@@ -608,7 +613,7 @@ export class WebVerifier {
         const opts = q.options
           .map(
             (opt, optIndex) =>
-              `<label class="quiz-opt"><input type="checkbox" name="q${index}" value="${optIndex + 1}"><span>${escapeHtml(opt)}</span></label>`
+              `<label class="quiz-opt"><input type="checkbox" name="q${index}" value="${optIndex}"><span>${escapeHtml(opt.text)}</span></label>`
           )
           .join('')
         return `<div class="quiz-q"><p class="quiz-title">${index + 1}. ${escapeHtml(q.question)}</p>${opts}</div>`
@@ -756,6 +761,13 @@ ${options.body}
 </body>
 </html>`
   }
+}
+
+/** 判断「是否正确」这一列：1 / true / yes / 是 / √ / 勾 都算真 */
+function isTruthyFlag(value: any): boolean {
+  const text = String(value ?? '').trim().toLowerCase()
+  if (!text) return false
+  return ['1', 'true', 'yes', 'y', '是', '对', '√', '✓', '✔', 'on'].includes(text)
 }
 
 /** HTML 转义 */
