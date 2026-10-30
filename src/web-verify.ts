@@ -302,6 +302,15 @@ export class WebVerifier {
 
     if (req.method === 'POST') {
       const form = await readForm(req)
+
+      // 问卷分步作答：step + answers 都是隐藏域，pick 是本题勾的选项
+      const isPagedQuiz = this.config.verifyMode === 'quiz' && form.step !== undefined
+
+      if (isPagedQuiz) {
+        await this.handleQuizStep(opid, guildId ?? '', form, res)
+        return
+      }
+
       // quiz 模式的表单字段是 q0/q1/…（每题的选中项），把它序列化成 q0=1,2&q1=3 再判卷
       const answer =
         String(form.answer ?? form.a ?? form.input ?? '').trim() ||
@@ -318,6 +327,100 @@ export class WebVerifier {
     }
 
     await this.handlePage(opid, guildId, res)
+  }
+
+  /** 问卷分步：本题勾选 → 还有下一题就换页，最后一题则整卷判分 */
+  private async handleQuizStep(
+    opid: string,
+    guildId: string,
+    form: Record<string, string>,
+    res: ServerResponse
+  ): Promise<void> {
+    const record = await this.resolveRecord(opid, guildId || undefined)
+    if (!record) {
+      this.sendHtml(res, 404, this.simplePage('🤔 没有待验证的题目', '可能已经验证通过，或者链接已失效。'))
+      return
+    }
+
+    // 冷却中
+    const notBefore = Number(record.notBefore ?? 0)
+    if (notBefore > Date.now()) {
+      const minutes = Math.ceil((notBefore - Date.now()) / 60000)
+      this.sendHtml(res, 200, this.simplePage('⏳ 冷却中', `请 <b>${minutes}</b> 分钟后再试。`))
+      return
+    }
+
+    const questions = this.getQuizQuestions()
+    const total = questions.length
+    const step = Math.max(0, Math.min(total - 1, parseInt(form.step ?? '0', 10) || 0))
+    const attempts = Number(record.webAttempts ?? 0)
+    const maxAttempts = Math.max(1, this.config.webMaxAttempts)
+    const left = Math.max(0, maxAttempts - attempts)
+
+    // 收集本题勾选（同名 pick 可能是多值，readForm 只留了非空第一个，所以再解析原始字段）
+    const picks = (form.pick ?? '')
+      .split(',')
+      .map((v) => v.trim())
+      .filter((v) => v !== '')
+
+    // 之前题目的答案（q0=…&q1=…）
+    const carried = new URLSearchParams(form.answers ?? '')
+
+    // 本题一题都没勾，提示一下留在当前题
+    if (!picks.length) {
+      this.sendHtml(
+        res,
+        200,
+        this.renderQuizPage(record.guildId, opid, left, '这一题还没选呢，勾一个再继续~', step, [], carried.toString())
+      )
+      return
+    }
+
+    carried.set(`q${step}`, picks.join(','))
+
+    // 还有下一题：继续翻页
+    if (step < total - 1) {
+      this.sendHtml(
+        res,
+        200,
+        this.renderQuizPage(record.guildId, opid, left, undefined, step + 1, [], carried.toString())
+      )
+      return
+    }
+
+    // 最后一题：整卷判分
+    const passedQuiz = this.checkQuizAnswer(carried.toString())
+    const nextAttempts = attempts + 1
+
+    if (passedQuiz) {
+      await this.db.passWebRecord(record.id, nextAttempts)
+      await this.unmuteAndPass(opid, record)
+      this.sendHtml(res, 200, this.simplePage('✅ 验证通过', '问卷通过，已自动解除禁言，回群里玩吧~'))
+      return
+    }
+
+    if (nextAttempts >= maxAttempts) {
+      const cooldownMs = Math.max(1, this.config.webCooldownMinutes) * 60 * 1000
+      await this.db.setWebState(record.id, { webAttempts: 0, notBefore: Date.now() + cooldownMs })
+      this.sendHtml(
+        res,
+        200,
+        this.simplePage(
+          '😵 答错太多次了',
+          `本轮 ${maxAttempts} 次机会已经用完，请 <b>${this.config.webCooldownMinutes}</b> 分钟后再打开本页面重试。`
+        )
+      )
+      return
+    }
+
+    await this.db.setWebState(record.id, { webAttempts: nextAttempts })
+    const leftAfter = maxAttempts - nextAttempts
+    // 回到第一题重新答
+    this.sendHtml(
+      res,
+      200,
+      this.renderQuizPage(record.guildId, opid, leftAfter, `没达到达成率要求，你还有 ${leftAfter} 次机会`, 0, [], '')
+    )
   }
 
   /** Cloudflare Turnstile 服务端校验；未启用时直接放行 */
@@ -713,41 +816,79 @@ export class WebVerifier {
 
   // ==================== 页面渲染 ====================
 
-  /** 问卷页：多题多选 + Turnstile */
-  private renderQuizPage(guildId: string, opid: string, left: number, notice?: string): string {
+  /** 问卷页：一次只显示一题，点选后「下一题」，最后一题提交 */
+  private renderQuizPage(
+    guildId: string,
+    opid: string,
+    left: number,
+    notice?: string,
+    step = 0,
+    picked: string[] = [],
+    answers: string = ''
+  ): string {
     const questions = this.getQuizQuestions()
     const action = `?g=${encodeURIComponent(guildId)}`
 
     if (!questions.length) {
       return this.renderPage({
         title: '问卷未配置',
-        body: `<div class="card"><h1>📋 问卷未配置</h1><p>管理员还没有配置问卷题目，请在插件配置的「问卷题目列表」里添加。</p></div>`,
+        body: `<div class="card"><h1>📋 问卷未配置</h1><p>管理员还没有配置问卷题目，请在插件配置里添加题目和选项。</p></div>`,
       })
     }
 
-    const body = questions
-      .map((q, index) => {
-        const opts = q.options
-          .map(
-            (opt, optIndex) =>
-              `<label class="quiz-opt"><input type="checkbox" name="q${index}" value="${optIndex}"><span>${escapeHtml(opt.text)}</span></label>`
-          )
-          .join('')
-        return `<div class="quiz-q"><p class="quiz-title">${index + 1}. ${escapeHtml(q.question)}</p>${opts}</div>`
+    // 兜底：步骤越界就回到第一题
+    const index = Math.max(0, Math.min(questions.length - 1, step))
+    const q = questions[index]
+    const total = questions.length
+    const isLast = index === total - 1
+    const need = Math.max(1, Math.min(100, Math.round(this.config.quizPassRate ?? 100)))
+
+    // 隐藏域：带着已答的题目（q0=…&q1=…）往下传，最后一题一次性提交
+    const carried = new URLSearchParams(answers)
+    const hidden = [...carried.entries()]
+      .map(([key, value]) => `<input type="hidden" name="${escapeHtml(key)}" value="${escapeHtml(value)}">`)
+      .join('')
+
+    const current = new URLSearchParams(answers).get(`q${index}`) ?? ''
+    const currentPicks = new Set(current.split(',').filter(Boolean))
+
+    const opts = q.options
+      .map((opt, optIndex) => {
+        const checked = currentPicks.has(String(optIndex)) ? ' checked' : ''
+        return `<label class="choice">
+  <input type="checkbox" name="pick" value="${optIndex}"${checked}>
+  <span class="box"></span>
+  <span class="choice-text">${escapeHtml(opt.text)}</span>
+</label>`
       })
+      .join('\n')
+
+    // 进度点
+    const dots = questions
+      .map((_, i) => `<span class="dot${i === index ? ' cur' : ''}${i < index ? ' done' : ''}"></span>`)
       .join('')
 
     return this.renderPage({
-      title: '入群问卷',
+      title: `问卷 ${index + 1}/${total}`,
       body: `<div class="card">
-<h1>📋 入群问卷</h1>
+<div class="quiz-head">
+  <span class="quiz-badge">第 ${index + 1} / ${total} 题</span>
+  <span class="quiz-dots">${dots}</span>
+</div>
+<div class="progress"><i style="width:${Math.round(((index + (currentPicks.size ? 1 : 0)) / total) * 100)}%"></i></div>
 ${notice ? `<p class="notice">${escapeHtml(notice)}</p>` : ''}
-<p class="prompt">完成下面的问卷即可加入本群（达成率要求 <b>${Math.max(1, Math.min(100, Math.round(this.config.quizPassRate ?? 100)))}%</b>，多选题把所有正确选项都勾上）</p>
-<form method="POST" action="${action}">
-${body}
-<button class="submit" type="submit">提交问卷</button>
+<h1 class="quiz-title">${escapeHtml(q.question)}</h1>
+<p class="quiz-tip">多选题可勾选多个选项</p>
+<form method="POST" action="${action}" class="quiz-form">
+${hidden}
+<input type="hidden" name="step" value="${index}">
+<input type="hidden" name="answers" value="${escapeHtml(answers)}">
+<div class="choices">
+${opts}
+</div>
+<button class="submit" type="submit">${isLast ? '提交问卷' : '下一题 →'}</button>
 </form>
-<p class="hint">剩余机会：<b>${left}</b> 次 ｜ 答错太多次会进入冷却</p>
+<p class="hint">达成率要求 <b>${need}%</b> ｜ 剩余机会 <b>${left}</b> 次</p>
 </div>`,
     })
   }
@@ -763,12 +904,17 @@ ${body}
     return this.renderPage({
       title: '人机验证',
       body: `<div class="card">
-<h1>🛡️ 人机验证</h1>
+<div class="quiz-head">
+  <span class="quiz-badge">🛡️ 安全验证</span>
+</div>
+<h1>人机验证</h1>
 <p class="prompt">${subtitle}</p>
 ${notice ? `<p class="notice">${notice}</p>` : ''}
-<form method="POST" action="${action}">
+<form method="POST" action="${action}" class="quiz-form">
+<div style="display:flex;justify-content:center;margin:0 0 18px">
 ${this.turnstileWidget()}
-<button class="submit" type="submit">${isPure ? '确认' : '继续'}</button>
+</div>
+<button class="submit" type="submit">${isPure ? '确认' : '通过后继续 →'}</button>
 </form>
 </div>`,
     })
@@ -813,12 +959,15 @@ ${this.turnstileWidget()}
     return this.renderPage({
       title: '入群验证',
       body: `<div class="card">
-<h1>🧪 入群验证</h1>
+<div class="quiz-head">
+  <span class="quiz-badge">🧪 手性碳验证</span>
+  <span class="quiz-badge" style="background:rgba(240,163,43,.12);color:#c07d10">剩余 ${left} 次</span>
+</div>
 ${notice ? `<p class="notice">${escapeHtml(notice)}</p>` : ''}
 <p class="prompt">${escapeHtml(question.prompt).replace(/\n/g, '<br>')}</p>
 ${question.imageBase64 && !isMath ? `<div class="pic"><img src="data:image/png;base64,${question.imageBase64}" alt="题目图片"></div>` : ''}
 ${answerArea}
-<p class="hint">剩余机会：<b>${left}</b> 次 ｜ 答错太多次会进入冷却</p>
+<p class="hint">点上面的区域代号作答 ｜ 答错太多次会进入冷却</p>
 </div>`,
     })
   }
@@ -839,37 +988,141 @@ ${answerArea}
 <meta name="referrer" content="no-referrer">
 <title>${escapeHtml(options.title)}</title>
 <style>
-  :root { color-scheme: light dark; }
+  :root {
+    color-scheme: light dark;
+    --brand: #4f7dfb;
+    --brand-soft: rgba(79,125,251,.10);
+    --line: #e3e7ee;
+    --text: #1f2329;
+    --muted: #6b7280;
+    --card: #fff;
+    --bg: #eef1f6;
+  }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   body {
-    margin: 0; padding: 16px;
-    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-    background: #f4f5f7; color: #1f2329;
-    display: flex; justify-content: center;
+    margin: 0; padding: 20px 16px 32px;
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: linear-gradient(180deg, #eef1f6 0%, #e7ebf3 100%);
+    color: var(--text);
+    display: flex; justify-content: center; align-items: flex-start;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
   }
-  .card { width: 100%; max-width: 560px; background: #fff; border-radius: 14px; padding: 18px; box-shadow: 0 2px 14px rgba(0,0,0,.07); }
-  h1 { font-size: 19px; margin: 0 0 10px; }
-  .prompt { color: #4a5057; font-size: 15px; margin: 0 0 12px; }
-  .notice { background: #fff4e5; color: #9a5b00; border-radius: 8px; padding: 8px 10px; font-size: 14px; margin: 0 0 12px; }
-  .pic img { width: 100%; height: auto; border-radius: 10px; display: block; margin: 0 0 14px; background: #fff; }
-  .options { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin: 0 0 12px; }
-  .opt { padding: 12px 0; border-radius: 10px; border: 1px solid #d6dae0; background: #f7f9fc; font-size: 15px; font-weight: 600; color: #1f2329; cursor: pointer; }
-  .opt:active { background: #e8eefc; border-color: #3b7cf6; }
-  .num { grid-column: 1 / -1; padding: 12px; border-radius: 10px; border: 1px solid #d6dae0; font-size: 16px; width: 100%; }
-  .submit { width: 100%; padding: 12px; border: 0; border-radius: 10px; background: #3b7cf6; color: #fff; font-size: 16px; font-weight: 600; }
-  .hint { color: #868d95; font-size: 13px; margin: 12px 0 0; }
-  details { margin: 6px 0 0; }
-  details summary { color: #6b7280; font-size: 13px; cursor: pointer; }
-  code { background: rgba(127,127,127,.15); padding: 1px 5px; border-radius: 5px; }
+  .card {
+    width: 100%; max-width: 520px; background: var(--card);
+    border-radius: 18px; padding: 22px 20px 20px;
+    box-shadow: 0 12px 32px rgba(20,30,60,.10), 0 2px 6px rgba(20,30,60,.04);
+    animation: rise .22s ease-out;
+  }
+  @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  h1 { font-size: 19px; margin: 0 0 12px; letter-spacing: .2px; }
+  .prompt { color: var(--muted); font-size: 14.5px; margin: 0 0 14px; }
+  .notice {
+    background: #fff6e8; color: #96590a; border-radius: 12px;
+    padding: 10px 13px; font-size: 13.5px; margin: 0 0 14px;
+    border-left: 3px solid #f0a32b; line-height: 1.55;
+  }
+  .pic img { width: 100%; height: auto; border-radius: 14px; display: block; margin: 0 0 16px; background: #fff; }
+
+  /* 区域代号按钮网格 */
+  .options { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 9px; margin: 0 0 14px; }
+  .opt {
+    padding: 13px 0; border-radius: 12px; border: 1.5px solid var(--line);
+    background: #f8fafc; font-size: 15px; font-weight: 700; color: var(--text);
+    cursor: pointer; transition: transform .1s, background .15s, border-color .15s;
+    font-family: inherit;
+  }
+  .opt:hover { border-color: var(--brand); background: var(--brand-soft); }
+  .opt:active { transform: scale(.95); background: #dbe6ff; border-color: var(--brand); }
+  .num {
+    grid-column: 1 / -1; padding: 13px 14px; border-radius: 12px;
+    border: 1.5px solid var(--line); font-size: 16px; width: 100%;
+    background: #f8fafc; color: var(--text); font-family: inherit;
+  }
+  .num:focus { outline: none; border-color: var(--brand); background: #fff; }
+
+  /* 主按钮 */
+  .submit {
+    width: 100%; padding: 14px; border: 0; border-radius: 13px;
+    background: linear-gradient(135deg, #5b87ff, #3f6bf0);
+    color: #fff; font-size: 16px; font-weight: 700; cursor: pointer;
+    box-shadow: 0 6px 16px rgba(63,107,240,.28);
+    transition: transform .1s, box-shadow .15s; font-family: inherit;
+  }
+  .submit:hover { box-shadow: 0 8px 20px rgba(63,107,240,.34); }
+  .submit:active { transform: translateY(1px) scale(.995); }
+
+  .hint { color: var(--muted); font-size: 13px; margin: 14px 0 0; text-align: center; }
+  .hint b { color: var(--text); }
+
+  details { margin: 14px 0 0; }
+  details summary { color: var(--muted); font-size: 13px; cursor: pointer; text-align: center; }
+  code { background: rgba(127,127,127,.15); padding: 1px 6px; border-radius: 5px; font-size: .92em; }
+
+  /* ============ 问卷：一次一题 ============ */
+  .quiz-head { display: flex; align-items: center; justify-content: space-between; margin: 0 0 10px; }
+  .quiz-badge {
+    display: inline-block; padding: 4px 11px; border-radius: 999px;
+    background: var(--brand-soft); color: var(--brand);
+    font-size: 12.5px; font-weight: 700; letter-spacing: .2px;
+  }
+  .quiz-dots { display: flex; gap: 5px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: #d9dee7; transition: all .2s; }
+  .dot.done { background: #9db9ff; }
+  .dot.cur { background: var(--brand); transform: scale(1.35); }
+  .progress { height: 4px; border-radius: 99px; background: #e8ecf3; overflow: hidden; margin: 0 0 18px; }
+  .progress i { display: block; height: 100%; border-radius: 99px; background: linear-gradient(90deg, #6b93ff, #3f6bf0); transition: width .3s ease; }
+  .quiz-title {
+    font-size: 18px; line-height: 1.55; font-weight: 700;
+    margin: 0 0 6px; word-break: break-word;
+  }
+  .quiz-tip { color: var(--muted); font-size: 12.5px; margin: 0 0 16px; }
+  .choices { display: flex; flex-direction: column; gap: 10px; margin: 0 0 18px; }
+  .choice {
+    display: flex; align-items: flex-start; gap: 11px;
+    padding: 14px 15px; border-radius: 13px;
+    border: 1.5px solid var(--line); background: #f8fafc;
+    cursor: pointer; transition: border-color .15s, background .15s, transform .08s;
+    line-height: 1.5;
+  }
+  .choice:hover { border-color: #b9c9f7; background: #f3f7ff; }
+  .choice:active { transform: scale(.995); }
+  .choice input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .choice .box {
+    flex: 0 0 auto; width: 20px; height: 20px; margin-top: 1px;
+    border-radius: 6px; border: 2px solid #c5cdda; background: #fff;
+    position: relative; transition: all .15s;
+  }
+  .choice .choice-text { flex: 1 1 auto; font-size: 15px; word-break: break-word; }
+  .choice input:checked ~ .box { background: var(--brand); border-color: var(--brand); }
+  .choice input:checked ~ .box::after {
+    content: ''; position: absolute; left: 5px; top: 1.5px;
+    width: 5px; height: 10px; border: solid #fff; border-width: 0 2.5px 2.5px 0;
+    transform: rotate(45deg);
+  }
+  .choice:has(input:checked) { border-color: var(--brand); background: var(--brand-soft); }
+  .quiz-form { margin: 0; }
+
   .ok h1 { color: #16a34a; }
   .warn h1 { color: #d97706; }
+
   @media (prefers-color-scheme: dark) {
-    body { background: #16181c; color: #e6e8eb; }
-    .card { background: #202329; box-shadow: none; }
-    .opt { background: #2a2e36; border-color: #3a3f48; color: #e6e8eb; }
-    .num { background: #2a2e36; border-color: #3a3f48; color: #e6e8eb; }
-    .prompt { color: #b6bcc4; }
-    .hint { color: #8b929b; }
+    :root {
+      --line: #363b45; --text: #e7e9ed; --muted: #9aa3ae;
+      --card: #1c1f25; --bg: #121418; --brand-soft: rgba(90,133,255,.16);
+    }
+    body { background: linear-gradient(180deg, #121418 0%, #0e1013 100%); }
+    .card { box-shadow: 0 12px 32px rgba(0,0,0,.45); }
+    .opt { background: #24282f; color: var(--text); }
+    .opt:hover { background: rgba(90,133,255,.16); }
+    .num { background: #24282f; color: var(--text); }
+    .num:focus { background: #1a1d22; }
+    .choice { background: #24282f; }
+    .choice:hover { background: rgba(90,133,255,.10); }
+    .choice .box { background: #1a1d22; border-color: #4a515c; }
+    .notice { background: rgba(240,163,43,.13); color: #f2b45c; }
+    .progress { background: #2b3038; }
+    .dot { background: #3a4048; }
   }
 </style>
 </head>
@@ -896,7 +1149,10 @@ function escapeHtml(text: string): string {
     .replace(/"/g, '&quot;')
 }
 
-/** 读 POST 表单（application/x-www-form-urlencoded）；同名 key 取第一个非空值 */
+/**
+ * 读 POST 表单（application/x-www-form-urlencoded）。
+ * 同名 key 取第一个非空值；同一个 key 的多个值（如多选题的 pick）用逗号接起来。
+ */
 async function readForm(req: IncomingMessage): Promise<Record<string, string>> {
   const chunks: Buffer[] = []
   let size = 0
@@ -904,8 +1160,8 @@ async function readForm(req: IncomingMessage): Promise<Record<string, string>> {
   for await (const chunk of req) {
     const buffer = Buffer.from(chunk as any)
     size += buffer.length
-    // 表单很小，超过 16KB 直接丢弃
-    if (size > 16 * 1024) break
+    // 表单很小，超过 64KB 直接丢弃
+    if (size > 64 * 1024) break
     chunks.push(buffer)
   }
 
@@ -914,9 +1170,9 @@ async function readForm(req: IncomingMessage): Promise<Record<string, string>> {
   const result: Record<string, string> = {}
 
   for (const key of new Set(params.keys())) {
-    const values = params.getAll(key)
-    const nonEmpty = values.find((v) => v.trim() !== '')
-    result[key] = nonEmpty ?? values[0] ?? ''
+    const values = params.getAll(key).filter((v) => v.trim() !== '')
+    if (values.length > 1) result[key] = values.join(',')
+    else result[key] = values[0] ?? params.getAll(key)[0] ?? ''
   }
 
   return result
