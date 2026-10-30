@@ -35,7 +35,17 @@ export interface GroupConfig {
 }
 
 /** 🔬 验证方式 */
-export type VerifyMode = 'message' | 'web'
+export type VerifyMode = 'message' | 'web' | 'quiz' | 'captcha'
+
+/** ❓ 问卷题目（quiz 模式用；options 为换行分隔的选项文本，correct 为从 1 开始的序号列表） */
+export interface QuizQuestion {
+  /** 题干 */
+  question: string
+  /** 选项，每行一个（存储层用换行分隔的字符串） */
+  options: string
+  /** 正确选项的序号（从 1 开始，逗号分隔，可多选） */
+  correct: string
+}
 
 /** 🧠 验证会话（内存中的验证状态） */
 export interface VerifySession {
@@ -115,6 +125,16 @@ export interface Config {
   webMaxAttempts: number
   /** ⏳ 网页验证次数用完后冷却多久（分钟） */
   webCooldownMinutes: number
+  /** ❓ 问卷题目（quiz 模式用） */
+  quizQuestions: QuizQuestion[]
+  /** 🎯 问卷达成率（%）：答对题数占比 ≥ 该值即通过，默认 100（全对） */
+  quizPassRate: number
+  /** 🛡️ 启用 Cloudflare Turnstile 人机验证（只对网页类模式生效：web / quiz） */
+  cfTurnstile: boolean
+  /** 🔑 Turnstile Sitekey（站点密钥） */
+  cfSiteKey: string
+  /** 🔑 Turnstile Secret Key（服务端密钥，只做后端校验，不会下发到页面） */
+  cfSecretKey: string
   /** 🗑️ 是否撤回错误回答 */
   recallWrongAnswer: boolean
   /** 👢 验证失败处理方式：none 不处理 / kick 踢出群 / ban 禁言后重试 */
@@ -189,6 +209,8 @@ export const Config: Schema<Config> = Schema.intersect([
     verifyMode: Schema.union([
       Schema.const('message').description('💬 群内作答：机器人发题目，用户在群里发区域代号 / 点按钮'),
       Schema.const('web').description('🌐 网页作答：进群先禁言，发提示 + 按钮，点开网页在网页里选题（不刷屏）'),
+      Schema.const('quiz').description('❓ 问卷作答：网页里回答自定义问卷（可多选、按达成率判定）'),
+      Schema.const('captcha').description('🛡️ 纯人机验证：网页里只做 Cloudflare Turnstile 人机验证，过了就解禁'),
     ])
       .default('message')
       .description('🔬 验证方式（可随时切换）'),
@@ -272,7 +294,38 @@ export const Config: Schema<Config> = Schema.intersect([
       .max(1440)
       .step(1)
       .description('⏳ 网页验证次数用完后冷却多少分钟才能再试（冷却期间打开网页只显示剩余时间）'),
-  }).description('🌐 网页验证（verifyMode = web 时生效）'),
+    quizQuestions: Schema.array(Schema.object({
+      question: Schema.string()
+        .role('textarea')
+        .description('❓ 题干')
+        .required(),
+      options: Schema.string()
+        .role('textarea')
+        .description('📝 选项，**每行一个**')
+        .required(),
+      correct: Schema.string()
+        .description('✅ 正确选项序号，从 1 开始，多选用逗号隔开（如 `2` 或 `1,3`）')
+        .required(),
+    }))
+      .role('table')
+      .default([])
+      .description('❓ 问卷题目列表（quiz 模式用；至少配 1 题才能用问卷模式）'),
+    quizPassRate: Schema.number()
+      .default(100)
+      .min(1)
+      .max(100)
+      .step(1)
+      .description('🎯 问卷达成率（%）：答对题数占比 ≥ 这个值就算通过。默认 100 = 全对；设 60 = 10 题对 6 题就过'),
+    cfTurnstile: Schema.boolean()
+      .default(false)
+      .description('🛡️ 启用 Cloudflare Turnstile 人机验证（**只对网页类模式生效**：web / quiz；captcha 模式本身就靠它）。需要在 Cloudflare 控制台创建 Turnstile Widget 并把域名填进 Hostname'),
+    cfSiteKey: Schema.string()
+      .default('')
+      .description('🔑 Turnstile Sitekey（站点密钥，会下发到页面）。调试可用测试键 `1x00000000000000000000AA`（永远通过）'),
+    cfSecretKey: Schema.string()
+      .default('')
+      .description('🔑 Turnstile Secret Key（服务端密钥，只做后端校验）。调试可用测试键 `1x0000000000000000000000000000000AA`（永远通过）'),
+  }).description('🌐 网页验证（verifyMode = web / quiz / captcha 时生效）'),
 
   Schema.object({
     masterAccounts: Schema.array(Schema.object({

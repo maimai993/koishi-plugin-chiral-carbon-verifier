@@ -1,6 +1,6 @@
 import { Context, Logger, h } from 'koishi'
 import { createServer, IncomingMessage, Server, ServerResponse } from 'node:http'
-import { Config, VerifyStatus, VerifyType, VerifyRecord } from './types'
+import { Config, QuizQuestion, VerifyStatus, VerifyType, VerifyRecord } from './types'
 import { DatabaseService } from './database'
 import { Verifier, renderTemplate } from './verifier'
 import { linkButton } from './qq-button'
@@ -45,13 +45,29 @@ export class WebVerifier {
     return `${base}/${encodeURIComponent(userId)}`
   }
 
-  /** 配置是否可用（没填服务器地址就没法做网页验证） */
+  /** 配置是否可用（没填服务器地址就没法做网页验证；quiz/captcha 各自还有前置条件） */
   isReady(): boolean {
     const base = (this.config.webServer ?? '').trim()
     if (!/^https?:\/\//i.test(base)) {
       logger.warn('网页验证需要先在配置里填写「服务器地址」（如 https://verify.example.com:5140），本次退回群内作答')
       return false
     }
+
+    if (this.config.verifyMode === 'quiz' && !(this.config.quizQuestions ?? []).length) {
+      logger.warn('问卷模式（quiz）需要在配置里至少添加一道问卷题目，本次退回群内作答')
+      return false
+    }
+
+    if (this.config.verifyMode === 'captcha' && !this.config.cfTurnstile) {
+      logger.warn('纯人机验证模式（captcha）需要先启用「Cloudflare Turnstile 人机验证」，本次退回群内作答')
+      return false
+    }
+
+    if (this.config.verifyMode === 'captcha' && !(this.config.cfSiteKey ?? '').trim()) {
+      logger.warn('纯人机验证模式（captcha）需要填写 Turnstile Sitekey，本次退回群内作答')
+      return false
+    }
+
     return true
   }
 
@@ -219,13 +235,56 @@ export class WebVerifier {
 
     if (req.method === 'POST') {
       const form = await readForm(req)
-      const answer = String(form.answer ?? form.a ?? form.input ?? '').trim()
+      // quiz 模式的表单字段是 q0/q1/…（每题的选中项），把它序列化成 q0=1,2&q1=3 再判卷
+      const answer =
+        String(form.answer ?? form.a ?? form.input ?? '').trim() ||
+        Object.keys(form)
+          .filter((key) => /^q\d+$/.test(key))
+          .sort((a, b) => parseInt(a.slice(1), 10) - parseInt(b.slice(1), 10))
+          .map((key) => `${key}=${form[key]}`)
+          .join('&')
       const formGuild = String(form.g ?? '') || guildId
-      await this.handleSubmit(opid, formGuild, answer, res)
+      // Turnstile token（cf-turnstile-response），启用时必须先过人机验证
+      const turnstileToken = String(form['cf-turnstile-response'] ?? '').trim()
+      await this.handleSubmit(opid, formGuild, answer, turnstileToken, res)
       return
     }
 
     await this.handlePage(opid, guildId, res)
+  }
+
+  /** Cloudflare Turnstile 服务端校验；未启用时直接放行 */
+  private async verifyTurnstile(token: string, ip?: string): Promise<boolean> {
+    if (!this.config.cfTurnstile) return true
+
+    const secret = (this.config.cfSecretKey ?? '').trim()
+    if (!secret) {
+      logger.warn('已启用 Turnstile 但没填 Secret Key，本次放行（请补全配置）')
+      return true
+    }
+    if (!token) return false
+
+    try {
+      const body = new URLSearchParams({ secret, response: token })
+      if (ip) body.set('remoteip', ip)
+
+      const result: any = await this.ctx.http.post(
+        'https://challenges.cloudflare.com/turnstile/v0/siteverify',
+        body.toString(),
+        {
+          headers: { 'content-type': 'application/x-www-form-urlencoded' },
+          timeout: this.config.apiTimeout,
+        }
+      )
+
+      if (result?.success) return true
+
+      logger.warn(`Turnstile 校验失败: ${JSON.stringify(result?.['error-codes'] ?? result)}`)
+      return false
+    } catch (error) {
+      logger.error('Turnstile 校验请求失败:', error)
+      return false
+    }
   }
 
   /** HTML 响应 */
@@ -281,10 +340,20 @@ export class WebVerifier {
       return
     }
 
-    const question = await this.getQuestion(record.guildId, opid)
     const attempts = Number(record.webAttempts ?? 0)
     const left = Math.max(0, Math.max(1, this.config.webMaxAttempts) - attempts)
 
+    // 按验证方式出页面
+    if (this.config.verifyMode === 'quiz') {
+      this.sendHtml(res, 200, this.renderQuizPage(record.guildId, opid, left))
+      return
+    }
+    if (this.config.verifyMode === 'captcha') {
+      this.sendHtml(res, 200, this.renderCaptchaPage(record.guildId, opid))
+      return
+    }
+
+    const question = await this.getQuestion(record.guildId, opid)
     this.sendHtml(res, 200, this.renderQuestionPage(record.guildId, question, left))
   }
 
@@ -293,6 +362,7 @@ export class WebVerifier {
     opid: string,
     guildId: string | undefined,
     answer: string,
+    turnstileToken: string,
     res: ServerResponse
   ): Promise<void> {
     const record = await this.resolveRecord(opid, guildId)
@@ -311,12 +381,70 @@ export class WebVerifier {
       return
     }
 
+    // captcha 模式：只看人机验证
+    if (this.config.verifyMode === 'captcha') {
+      const human = await this.verifyTurnstile(turnstileToken)
+      if (!human) {
+        this.sendHtml(res, 200, this.renderCaptchaPage(record.guildId, opid, '人机验证没通过，请再试一次'))
+        return
+      }
+
+      await this.db.passWebRecord(record.id, 1)
+      await this.unmuteAndPass(opid, record)
+      this.sendHtml(res, 200, this.simplePage('✅ 验证通过', '人机验证已完成，已自动解除禁言，回群里玩吧~'))
+      return
+    }
+
+    // quiz 模式：整卷判定（达成率）
+    if (this.config.verifyMode === 'quiz') {
+      const human = await this.verifyTurnstile(turnstileToken)
+      if (!human) {
+        this.sendHtml(res, 200, this.renderQuizPage(record.guildId, opid, Math.max(1, this.config.webMaxAttempts), '人机验证没通过，请再试一次'))
+        return
+      }
+
+      const passedQuiz = this.checkQuizAnswer(answer)
+      const attempts = Number(record.webAttempts ?? 0) + 1
+      const maxAttempts = Math.max(1, this.config.webMaxAttempts)
+
+      if (passedQuiz) {
+        await this.db.passWebRecord(record.id, attempts)
+        await this.unmuteAndPass(opid, record)
+        this.sendHtml(res, 200, this.simplePage('✅ 验证通过', '问卷通过，已自动解除禁言，回群里玩吧~'))
+        return
+      }
+
+      if (attempts >= maxAttempts) {
+        const cooldownMs = Math.max(1, this.config.webCooldownMinutes) * 60 * 1000
+        await this.db.setWebState(record.id, { webAttempts: 0, notBefore: Date.now() + cooldownMs })
+        this.sendHtml(res, 200, this.simplePage('😵 答错太多次了',
+          `本轮 ${maxAttempts} 次机会已经用完，请 <b>${this.config.webCooldownMinutes}</b> 分钟后再打开本页面重试。`))
+        return
+      }
+
+      await this.db.setWebState(record.id, { webAttempts: attempts })
+      const left = maxAttempts - attempts
+      this.sendHtml(res, 200, this.renderQuizPage(record.guildId, opid, left, `没达到达成率要求，你还有 ${left} 次机会`))
+      return
+    }
+
+    // === web（手性碳/数字）模式 ===
     if (!answer) {
       this.sendHtml(
         res,
         200,
         this.simplePage('请先选择答案', `<p><a href="?g=${encodeURIComponent(record.guildId)}">← 返回题目</a></p>`)
       )
+      return
+    }
+
+    // Turnstile 校验（web 模式启用了才校验）
+    const human = await this.verifyTurnstile(turnstileToken)
+    if (!human) {
+      const attempts = Number(record.webAttempts ?? 0)
+      const left = Math.max(0, Math.max(1, this.config.webMaxAttempts) - attempts)
+      const question = await this.getQuestion(record.guildId, opid)
+      this.sendHtml(res, 200, this.renderQuestionPage(record.guildId, question, left, '人机验证没通过，请重试'))
       return
     }
 
@@ -370,6 +498,68 @@ export class WebVerifier {
     this.sendHtml(res, 200, this.renderQuestionPage(record.guildId, next, left, `回答错了呢，你还有 ${left} 次机会`))
   }
 
+  /** 验证通过后的公共动作：标记记录 + 解除禁言（群里不发消息） */
+  private async unmuteAndPass(opid: string, record: VerifyRecord): Promise<void> {
+    const bot = this.pickBot(record.platform)
+    if (bot) {
+      const unmuted = await this.mute({ guildId: record.guildId, userId: opid, bot }, 0)
+      if (!unmuted) logger.warn(`用户 ${opid} 验证通过了，但解除禁言失败（可能没管理员权限）`)
+    } else {
+      logger.warn(`没有在线的 ${record.platform} 机器人，无法解除用户 ${opid} 的禁言`)
+    }
+    logger.info(`用户 ${opid} 网页验证通过（模式 ${this.config.verifyMode}），已解除禁言`)
+  }
+
+  /** 判卷：按达成率算对了几题（answer 形如 `q0=1,2&q1=3`，选项序号从 1 开始） */
+  private checkQuizAnswer(answer: string): boolean {
+    const questions = this.getQuizQuestions()
+    if (!questions.length) return false
+
+    const params = new URLSearchParams(answer)
+    let correctCount = 0
+
+    questions.forEach((q, index) => {
+      const picked = (params.get(`q${index}`) ?? '')
+        .split(',')
+        .map((v) => parseInt(v.trim(), 10))
+        .filter((v) => Number.isInteger(v) && v > 0)
+      const correct = [...q.correct].sort((a, b) => a - b).join(',')
+      const mine = [...new Set(picked)].sort((a, b) => a - b).join(',')
+      if (mine && mine === correct) correctCount++
+    })
+
+    const rate = Math.round((correctCount / questions.length) * 100)
+    const need = Math.max(1, Math.min(100, Math.round(this.config.quizPassRate ?? 100)))
+    logger.info(`问卷判卷：${correctCount}/${questions.length} 题（达成率 ${rate}%，需要 ${need}%）`)
+    return rate >= need
+  }
+
+  /** Turnstile 页面组件（未启用时返回空串） */
+  private turnstileWidget(): string {
+    if (!this.config.cfTurnstile) return ''
+    const siteKey = (this.config.cfSiteKey ?? '').trim()
+    if (!siteKey) return ''
+
+    return `
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+<div class="cf-turnstile" data-sitekey="${escapeHtml(siteKey)}"></div>`
+  }
+
+  /** 取 quiz 题目（把配置的多行文本拆成数组） */
+  private getQuizQuestions() {
+    return (this.config.quizQuestions ?? []).map((q) => ({
+      question: q.question,
+      options: String(q.options ?? '')
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean),
+      correct: String(q.correct ?? '')
+        .split(/[,，\s]+/)
+        .map((v) => parseInt(v.trim(), 10))
+        .filter((v) => Number.isInteger(v) && v > 0),
+    }))
+  }
+
   /** 取 / 生成题目：10 分钟内沿用同一道题 */
   private async getQuestion(guildId: string, userId: string): Promise<WebQuestion> {
     const key = `${guildId}_${userId}`
@@ -400,6 +590,64 @@ export class WebVerifier {
   }
 
   // ==================== 页面渲染 ====================
+
+  /** 问卷页：多题多选 + Turnstile */
+  private renderQuizPage(guildId: string, opid: string, left: number, notice?: string): string {
+    const questions = this.getQuizQuestions()
+    const action = `?g=${encodeURIComponent(guildId)}`
+
+    if (!questions.length) {
+      return this.renderPage({
+        title: '问卷未配置',
+        body: `<div class="card"><h1>📋 问卷未配置</h1><p>管理员还没有配置问卷题目，请在插件配置的「问卷题目列表」里添加。</p></div>`,
+      })
+    }
+
+    const body = questions
+      .map((q, index) => {
+        const opts = q.options
+          .map(
+            (opt, optIndex) =>
+              `<label class="quiz-opt"><input type="checkbox" name="q${index}" value="${optIndex + 1}"><span>${escapeHtml(opt)}</span></label>`
+          )
+          .join('')
+        return `<div class="quiz-q"><p class="quiz-title">${index + 1}. ${escapeHtml(q.question)}</p>${opts}</div>`
+      })
+      .join('')
+
+    return this.renderPage({
+      title: '入群问卷',
+      body: `<div class="card">
+<h1>📋 入群问卷</h1>
+${notice ? `<p class="notice">${escapeHtml(notice)}</p>` : ''}
+<p class="prompt">完成下面的问卷即可加入本群（达成率要求 <b>${Math.max(1, Math.min(100, Math.round(this.config.quizPassRate ?? 100)))}%</b>，多选题把所有正确选项都勾上）</p>
+<form method="POST" action="${action}">
+${body}
+${this.turnstileWidget()}
+<button class="submit" type="submit">提交问卷</button>
+</form>
+<p class="hint">剩余机会：<b>${left}</b> 次 ｜ 答错太多次会进入冷却</p>
+</div>`,
+    })
+  }
+
+  /** 纯人机验证页：只有 Turnstile */
+  private renderCaptchaPage(guildId: string, opid: string, notice?: string): string {
+    const action = `?g=${encodeURIComponent(guildId)}`
+
+    return this.renderPage({
+      title: '人机验证',
+      body: `<div class="card">
+<h1>🛡️ 人机验证</h1>
+${notice ? `<p class="notice">${escapeHtml(notice)}</p>` : ''}
+<p class="prompt">点击下面的复选框完成人机验证，通过后即可自动解除禁言</p>
+<form method="POST" action="${action}">
+${this.turnstileWidget()}
+<button class="submit" type="submit">确认</button>
+</form>
+</div>`,
+    })
+  }
 
   /** 题目页：题目图 + 区域代号选项 */
   private renderQuestionPage(
@@ -445,6 +693,9 @@ ${notice ? `<p class="notice">${escapeHtml(notice)}</p>` : ''}
 <p class="prompt">${escapeHtml(question.prompt).replace(/\n/g, '<br>')}</p>
 ${question.imageBase64 && !isMath ? `<div class="pic"><img src="data:image/png;base64,${question.imageBase64}" alt="题目图片"></div>` : ''}
 ${answerArea}
+<form method="POST" action="${action}">
+${this.turnstileWidget()}
+</form>
 <p class="hint">剩余机会：<b>${left}</b> 次 ｜ 答错太多次会进入冷却</p>
 </div>`,
     })
